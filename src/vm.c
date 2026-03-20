@@ -1,0 +1,2320 @@
+#include "cvm.h"
+#include "cclib.h"
+
+#include <cc/bytecode.h>
+#include <cc/diagnostics.h>
+#include <cc/loader.h>
+
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
+typedef struct VMValue {
+    uint64_t bits;
+    CCValueType type;
+    int is_unsigned;
+} VMValue;
+
+typedef struct LabelMap {
+    const char *name;
+    size_t index;
+} LabelMap;
+
+typedef struct GlobalSlot {
+    const char *name;
+    VMValue value;
+    int owns_ptr;
+} GlobalSlot;
+
+typedef struct RuntimeModule {
+    const char *name;
+    CCModule module;
+    GlobalSlot *globals;
+    size_t global_count;
+    uint8_t *ccbin_data;
+    size_t ccbin_size;
+} RuntimeModule;
+
+typedef struct FuncAlias {
+    char *alias;
+    const CCFunction *target;
+    RuntimeModule *owner;
+} FuncAlias;
+
+typedef struct ImportHandle {
+    void *handle;
+    char *path;
+    int owned;
+} ImportHandle;
+
+typedef struct CVM {
+    RuntimeModule *mods;
+    size_t mod_count;
+    FuncAlias *aliases;
+    size_t alias_count;
+    ImportHandle *imports;
+    size_t import_count;
+    int verbose;
+    int jit_mode;
+    int jit_attempted;
+    const char *jit_cclib_path;
+    const CVMOptions *jit_options;
+    char **jit_compiled_functions;
+    size_t jit_compiled_count;
+} CVM;
+
+static int symbol_equivalent(const char *a, const char *b);
+static int rewrite_jit_asm_symbols(const char *asm_path);
+static int run_jit_from_cclib(const char *cclib_path, const CVMOptions *options, int *exit_code);
+static int jit_compile_function_once(CVM *vm, RuntimeModule *owner, const CCFunction *fn);
+
+static uint64_t f64_to_bits(double v) {
+    union {
+        double f;
+        uint64_t u;
+    } cvt;
+    cvt.f = v;
+    return cvt.u;
+}
+
+static double bits_to_f64(uint64_t v) {
+    union {
+        double f;
+        uint64_t u;
+    } cvt;
+    cvt.u = v;
+    return cvt.f;
+}
+
+static int64_t as_i64(VMValue v) {
+    if (v.type == CC_TYPE_F64) {
+        return (int64_t)bits_to_f64(v.bits);
+    }
+    return (int64_t)v.bits;
+}
+
+static uint64_t as_u64(VMValue v) {
+    if (v.type == CC_TYPE_F64) {
+        return (uint64_t)bits_to_f64(v.bits);
+    }
+    return v.bits;
+}
+
+static void free_runtime(CVM *vm) {
+    if (!vm) {
+        return;
+    }
+    if (vm->mods) {
+        for (size_t i = 0; i < vm->mod_count; ++i) {
+            RuntimeModule *m = &vm->mods[i];
+            if (m->globals) {
+                for (size_t g = 0; g < m->global_count; ++g) {
+                    if (m->globals[g].owns_ptr && m->globals[g].value.type == CC_TYPE_PTR && m->globals[g].value.bits != 0) {
+                        free((void *)(uintptr_t)m->globals[g].value.bits);
+                    }
+                }
+                free(m->globals);
+            }
+            cc_module_free(&m->module);
+            free((char *)m->name);
+            free(m->ccbin_data);
+        }
+        free(vm->mods);
+    }
+    if (vm->aliases) {
+        for (size_t i = 0; i < vm->alias_count; ++i) {
+            free(vm->aliases[i].alias);
+        }
+        free(vm->aliases);
+    }
+    if (vm->jit_compiled_functions) {
+        for (size_t i = 0; i < vm->jit_compiled_count; ++i) {
+            free(vm->jit_compiled_functions[i]);
+        }
+        free(vm->jit_compiled_functions);
+    }
+    if (vm->imports) {
+        for (size_t i = 0; i < vm->import_count; ++i) {
+            if (vm->imports[i].owned && vm->imports[i].handle) {
+                dlclose(vm->imports[i].handle);
+            }
+            free(vm->imports[i].path);
+        }
+        free(vm->imports);
+    }
+    memset(vm, 0, sizeof(*vm));
+}
+
+static int add_import_handle(CVM *vm, const char *path, int owned, void *handle) {
+    size_t next = vm->import_count + 1;
+    ImportHandle *grown = (ImportHandle *)realloc(vm->imports, next * sizeof(ImportHandle));
+    if (!grown) {
+        return -1;
+    }
+    vm->imports = grown;
+    vm->imports[vm->import_count].handle = handle;
+    vm->imports[vm->import_count].path = path ? strdup(path) : NULL;
+    vm->imports[vm->import_count].owned = owned;
+    vm->import_count = next;
+    return 0;
+}
+
+static int add_default_c_runtime_import(CVM *vm) {
+#if defined(__APPLE__)
+    const char *candidates[] = {
+        "/usr/lib/libSystem.B.dylib",
+        "libSystem.B.dylib"
+    };
+#elif defined(__linux__)
+    const char *candidates[] = {
+        "libc.so.6",
+        "libc.so"
+    };
+#elif defined(_WIN32)
+    const char *candidates[] = {
+        "ucrtbase.dll",
+        "msvcrt.dll"
+    };
+#else
+    const char *candidates[] = {
+        "libc.so"
+    };
+#endif
+
+    for (size_t i = 0; i < (sizeof(candidates) / sizeof(candidates[0])); ++i) {
+        void *h = dlopen(candidates[i], RTLD_NOW | RTLD_GLOBAL);
+        if (!h) {
+            continue;
+        }
+        if (add_import_handle(vm, candidates[i], 1, h) != 0) {
+            dlclose(h);
+            return -1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+static void *resolve_extern_symbol(CVM *vm, const char *name) {
+    if (!name || !*name) {
+        return NULL;
+    }
+    for (size_t i = 0; i < vm->import_count; ++i) {
+        void *sym = dlsym(vm->imports[i].handle, name);
+        if (sym) {
+            return sym;
+        }
+    }
+
+#ifdef __APPLE__
+    char underscored[512];
+    if (snprintf(underscored, sizeof(underscored), "_%s", name) > 0) {
+        for (size_t i = 0; i < vm->import_count; ++i) {
+            void *sym = dlsym(vm->imports[i].handle, underscored);
+            if (sym) {
+                return sym;
+            }
+        }
+    }
+#endif
+
+    return NULL;
+}
+
+static uint64_t call_c_u64(void *fn, uint64_t *argv, size_t argc) {
+    switch (argc) {
+    case 0:
+        return ((uint64_t(*)(void))fn)();
+    case 1:
+        return ((uint64_t(*)(uint64_t))fn)(argv[0]);
+    case 2:
+        return ((uint64_t(*)(uint64_t, uint64_t))fn)(argv[0], argv[1]);
+    case 3:
+        return ((uint64_t(*)(uint64_t, uint64_t, uint64_t))fn)(argv[0], argv[1], argv[2]);
+    case 4:
+        return ((uint64_t(*)(uint64_t, uint64_t, uint64_t, uint64_t))fn)(argv[0], argv[1], argv[2], argv[3]);
+    case 5:
+        return ((uint64_t(*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t))fn)(argv[0], argv[1], argv[2], argv[3], argv[4]);
+    case 6:
+        return ((uint64_t(*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t))fn)(argv[0], argv[1], argv[2], argv[3], argv[4], argv[5]);
+    case 7:
+        return ((uint64_t(*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t))fn)(argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6]);
+    case 8:
+        return ((uint64_t(*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t))fn)(argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]);
+    default:
+        return 0;
+    }
+}
+
+static int append_text(char **buf, size_t *len, size_t *cap, const char *text) {
+    if (!buf || !len || !cap || !text) {
+        return -1;
+    }
+    size_t n = strlen(text);
+    if (*len + n + 1 > *cap) {
+        size_t next = (*cap == 0) ? 128 : *cap;
+        while (*len + n + 1 > next) {
+            next *= 2;
+        }
+        char *grown = (char *)realloc(*buf, next);
+        if (!grown) {
+            return -1;
+        }
+        *buf = grown;
+        *cap = next;
+    }
+    memcpy(*buf + *len, text, n);
+    *len += n;
+    (*buf)[*len] = '\0';
+    return 0;
+}
+
+static char *format_builtin_varargs(VMValue *argv, size_t argc) {
+    if (!argv || argc == 0) {
+        return NULL;
+    }
+    const char *fmt = (const char *)(uintptr_t)argv[0].bits;
+    if (!fmt) {
+        return NULL;
+    }
+
+    char *out = NULL;
+    size_t out_len = 0;
+    size_t out_cap = 0;
+    size_t argi = 1;
+
+    for (size_t i = 0; fmt[i] != '\0'; ++i) {
+        if (fmt[i] != '%') {
+            char tmp[2] = {fmt[i], '\0'};
+            if (append_text(&out, &out_len, &out_cap, tmp) != 0) {
+                free(out);
+                return NULL;
+            }
+            continue;
+        }
+
+        if (fmt[i + 1] == '%') {
+            if (append_text(&out, &out_len, &out_cap, "%") != 0) {
+                free(out);
+                return NULL;
+            }
+            ++i;
+            continue;
+        }
+
+        char spec = fmt[i + 1];
+        if (spec == '\0') {
+            break;
+        }
+        ++i;
+
+        if (argi >= argc) {
+            char fallback[3] = {'%', spec, '\0'};
+            if (append_text(&out, &out_len, &out_cap, fallback) != 0) {
+                free(out);
+                return NULL;
+            }
+            continue;
+        }
+
+        char tmp[128];
+        tmp[0] = '\0';
+        VMValue av = argv[argi++];
+        switch (spec) {
+        case 'd':
+        case 'i':
+            snprintf(tmp, sizeof(tmp), "%lld", (long long)as_i64(av));
+            break;
+        case 'u':
+            snprintf(tmp, sizeof(tmp), "%llu", (unsigned long long)as_u64(av));
+            break;
+        case 'x':
+            snprintf(tmp, sizeof(tmp), "%llx", (unsigned long long)as_u64(av));
+            break;
+        case 'X':
+            snprintf(tmp, sizeof(tmp), "%llX", (unsigned long long)as_u64(av));
+            break;
+        case 'p':
+            snprintf(tmp, sizeof(tmp), "%p", (void *)(uintptr_t)as_u64(av));
+            break;
+        case 'c':
+            snprintf(tmp, sizeof(tmp), "%c", (int)(as_u64(av) & 0xff));
+            break;
+        case 's': {
+            const char *s = (const char *)(uintptr_t)as_u64(av);
+            if (!s) {
+                s = "(null)";
+            }
+            if (append_text(&out, &out_len, &out_cap, s) != 0) {
+                free(out);
+                return NULL;
+            }
+            continue;
+        }
+        default: {
+            char fallback[3] = {'%', spec, '\0'};
+            if (append_text(&out, &out_len, &out_cap, fallback) != 0) {
+                free(out);
+                return NULL;
+            }
+            continue;
+        }
+        }
+
+        if (append_text(&out, &out_len, &out_cap, tmp) != 0) {
+            free(out);
+            return NULL;
+        }
+    }
+
+    if (!out) {
+        out = strdup("");
+    }
+    return out;
+}
+
+static int call_builtin_symbol(const char *symbol, VMValue *argv, size_t argc, uint64_t *out_ret) {
+    if (!symbol || !out_ret) {
+        return 0;
+    }
+
+    if (symbol_equivalent(symbol, "Std_IO_printnl_ptr_to_char") ||
+        symbol_equivalent(symbol, "Std_IO_printnl_ptr_to_char_varargs")) {
+        if (argc >= 1) {
+            char *formatted = NULL;
+            const char *s = NULL;
+            if (symbol_equivalent(symbol, "Std_IO_printnl_ptr_to_char_varargs") || argc > 1) {
+                formatted = format_builtin_varargs(argv, argc);
+                s = formatted;
+            } else {
+                s = (const char *)(uintptr_t)argv[0].bits;
+            }
+            if (s) {
+                fputs(s, stdout);
+                if (strchr(s, '\n') == NULL) {
+                    fputc('\n', stdout);
+                }
+            }
+            free(formatted);
+            fflush(stdout);
+        }
+        *out_ret = 0;
+        return 1;
+    }
+
+    if (symbol_equivalent(symbol, "Std_IO_print_ptr_to_char") ||
+        symbol_equivalent(symbol, "Std_IO_print_ptr_to_char_varargs")) {
+        if (argc >= 1) {
+            char *formatted = NULL;
+            const char *s = NULL;
+            if (symbol_equivalent(symbol, "Std_IO_print_ptr_to_char_varargs") || argc > 1) {
+                formatted = format_builtin_varargs(argv, argc);
+                s = formatted;
+            } else {
+                s = (const char *)(uintptr_t)argv[0].bits;
+            }
+            if (s) {
+                fputs(s, stdout);
+            }
+            free(formatted);
+            fflush(stdout);
+        }
+        *out_ret = 0;
+        return 1;
+    }
+
+    return 0;
+}
+
+static char symbol_norm_char(char ch) {
+    if ((ch >= 'a' && ch <= 'z') ||
+        (ch >= 'A' && ch <= 'Z') ||
+        (ch >= '0' && ch <= '9')) {
+        return ch;
+    }
+    return '_';
+}
+
+static int symbol_equivalent(const char *a, const char *b) {
+    if (!a || !b) {
+        return 0;
+    }
+
+    size_t ia = 0;
+    size_t ib = 0;
+    while (a[ia] != '\0' && b[ib] != '\0') {
+        if (symbol_norm_char(a[ia]) != symbol_norm_char(b[ib])) {
+            return 0;
+        }
+        ia++;
+        ib++;
+    }
+    return a[ia] == '\0' && b[ib] == '\0';
+}
+
+static int add_func_alias(CVM *vm, const char *alias, RuntimeModule *owner, const CCFunction *target) {
+    if (!vm || !alias || !*alias || !target) {
+        return 0;
+    }
+    for (size_t i = 0; i < vm->alias_count; ++i) {
+        if (strcmp(vm->aliases[i].alias, alias) == 0) {
+            return 0;
+        }
+    }
+
+    size_t next = vm->alias_count + 1;
+    FuncAlias *grown = (FuncAlias *)realloc(vm->aliases, next * sizeof(FuncAlias));
+    if (!grown) {
+        return -1;
+    }
+    vm->aliases = grown;
+    vm->aliases[vm->alias_count].alias = strdup(alias);
+    if (!vm->aliases[vm->alias_count].alias) {
+        return -1;
+    }
+    vm->aliases[vm->alias_count].target = target;
+    vm->aliases[vm->alias_count].owner = owner;
+    vm->alias_count = next;
+    return 0;
+}
+
+static const CCFunction *find_function(CVM *vm, const char *name, RuntimeModule **owner) {
+    RuntimeModule *resolved_owner = NULL;
+
+    for (size_t ai = 0; ai < vm->alias_count; ++ai) {
+        FuncAlias *a = &vm->aliases[ai];
+        if (strcmp(a->alias, name) == 0 || symbol_equivalent(a->alias, name)) {
+            if (owner) {
+                for (size_t mi = 0; mi < vm->mod_count; ++mi) {
+                    RuntimeModule *m = &vm->mods[mi];
+                    const CCFunction *base = m->module.functions;
+                    const CCFunction *end = base + m->module.function_count;
+                    if (a->target >= base && a->target < end) {
+                        resolved_owner = m;
+                        break;
+                    }
+                }
+                *owner = resolved_owner;
+            }
+            return a->target;
+        }
+    }
+
+    for (size_t mi = 0; mi < vm->mod_count; ++mi) {
+        RuntimeModule *m = &vm->mods[mi];
+        for (size_t fi = 0; fi < m->module.function_count; ++fi) {
+            const CCFunction *fn = &m->module.functions[fi];
+            if (fn->name && (strcmp(fn->name, name) == 0 || symbol_equivalent(fn->name, name))) {
+                if (owner) {
+                    *owner = m;
+                }
+                return fn;
+            }
+        }
+    }
+
+    if (name && strstr(name, "_varargs") == NULL) {
+        char varargs_name[1024];
+        if (snprintf(varargs_name, sizeof(varargs_name), "%s_varargs", name) > 0) {
+            for (size_t ai = 0; ai < vm->alias_count; ++ai) {
+                FuncAlias *a = &vm->aliases[ai];
+                if (strcmp(a->alias, varargs_name) == 0 || symbol_equivalent(a->alias, varargs_name)) {
+                    if (owner) {
+                        resolved_owner = NULL;
+                        for (size_t mi = 0; mi < vm->mod_count; ++mi) {
+                            RuntimeModule *m = &vm->mods[mi];
+                            const CCFunction *base = m->module.functions;
+                            const CCFunction *end = base + m->module.function_count;
+                            if (a->target >= base && a->target < end) {
+                                resolved_owner = m;
+                                break;
+                            }
+                        }
+                        *owner = resolved_owner;
+                    }
+                    return a->target;
+                }
+            }
+
+            for (size_t mi = 0; mi < vm->mod_count; ++mi) {
+                RuntimeModule *m = &vm->mods[mi];
+                for (size_t fi = 0; fi < m->module.function_count; ++fi) {
+                    const CCFunction *fn = &m->module.functions[fi];
+                    if (fn->name && (strcmp(fn->name, varargs_name) == 0 || symbol_equivalent(fn->name, varargs_name))) {
+                        if (owner) {
+                            *owner = m;
+                        }
+                        return fn;
+                    }
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+static GlobalSlot *find_global_slot(CVM *vm, const char *name) {
+    for (size_t mi = 0; mi < vm->mod_count; ++mi) {
+        RuntimeModule *m = &vm->mods[mi];
+        for (size_t gi = 0; gi < m->global_count; ++gi) {
+            if (m->globals[gi].name && strcmp(m->globals[gi].name, name) == 0) {
+                return &m->globals[gi];
+            }
+        }
+    }
+    return NULL;
+}
+
+static int build_labels(const CCFunction *fn, LabelMap **out_labels, size_t *out_count) {
+    *out_labels = NULL;
+    *out_count = 0;
+    for (size_t i = 0; i < fn->instruction_count; ++i) {
+        if (fn->instructions[i].kind == CC_INSTR_LABEL) {
+            size_t next = *out_count + 1;
+            LabelMap *grown = (LabelMap *)realloc(*out_labels, next * sizeof(LabelMap));
+            if (!grown) {
+                free(*out_labels);
+                *out_labels = NULL;
+                *out_count = 0;
+                return -1;
+            }
+            *out_labels = grown;
+            (*out_labels)[*out_count].name = fn->instructions[i].data.label.name;
+            (*out_labels)[*out_count].index = i;
+            *out_count = next;
+        }
+    }
+    return 0;
+}
+
+static int label_index(LabelMap *labels, size_t count, const char *name, size_t *index) {
+    for (size_t i = 0; i < count; ++i) {
+        if (labels[i].name && strcmp(labels[i].name, name) == 0) {
+            *index = labels[i].index;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
+                            VMValue *args, size_t arg_count,
+                            VMValue *out_ret, int *has_ret) {
+    if (vm->jit_mode == 2 && vm->jit_options && owner && fn) {
+        if (jit_compile_function_once(vm, owner, fn) != 0 && vm->verbose) {
+            fprintf(stderr, "cvm[jit]: failed to compile '%s', continuing in interpreter\n", fn->name ? fn->name : "<unnamed>");
+        }
+    }
+
+    if (vm->jit_mode == 1 && !vm->jit_attempted && vm->jit_options) {
+        int jit_exit = 0;
+        vm->jit_attempted = 1;
+        int jit_rc = -1;
+        if (vm->jit_cclib_path) {
+            jit_rc = run_jit_from_cclib(vm->jit_cclib_path, vm->jit_options, &jit_exit);
+        }
+
+        if (jit_rc == 0) {
+            out_ret->bits = (uint64_t)(jit_exit & 0xff);
+            out_ret->type = fn->return_type;
+            out_ret->is_unsigned = 0;
+            *has_ret = (fn->return_type != CC_TYPE_VOID);
+            return 0;
+        }
+        if (vm->verbose) {
+            fprintf(stderr, "cvm[jit]: falling back to interpreter\n");
+        }
+    }
+
+    VMValue *locals = NULL;
+    if (fn->local_count > 0) {
+        locals = (VMValue *)calloc(fn->local_count, sizeof(VMValue));
+        if (!locals) {
+            return -1;
+        }
+        for (size_t i = 0; i < fn->local_count; ++i) {
+            locals[i].type = fn->local_types[i];
+        }
+    }
+
+    VMValue *stack = (VMValue *)calloc(8192, sizeof(VMValue));
+    if (!stack) {
+        free(locals);
+        return -1;
+    }
+    size_t sp = 0;
+
+    LabelMap *labels = NULL;
+    size_t label_count = 0;
+    if (build_labels(fn, &labels, &label_count) != 0) {
+        free(stack);
+        free(locals);
+        return -1;
+    }
+
+    for (size_t ip = 0; ip < fn->instruction_count; ++ip) {
+        const CCInstruction *ins = &fn->instructions[ip];
+
+        switch (ins->kind) {
+        case CC_INSTR_CONST: {
+            VMValue v;
+            memset(&v, 0, sizeof(v));
+            v.type = ins->data.constant.type;
+            v.is_unsigned = ins->data.constant.is_unsigned;
+            if (v.type == CC_TYPE_F32 || v.type == CC_TYPE_F64) {
+                double f = (v.type == CC_TYPE_F32)
+                               ? (double)ins->data.constant.value.f32
+                               : ins->data.constant.value.f64;
+                v.bits = f64_to_bits(f);
+                v.type = CC_TYPE_F64;
+            } else if (ins->data.constant.is_null) {
+                v.bits = 0;
+                v.type = CC_TYPE_PTR;
+            } else {
+                v.bits = ins->data.constant.is_unsigned
+                             ? ins->data.constant.value.u64
+                             : (uint64_t)ins->data.constant.value.i64;
+            }
+            stack[sp++] = v;
+            break;
+        }
+        case CC_INSTR_CONST_STRING: {
+            VMValue v;
+            memset(&v, 0, sizeof(v));
+            char *s = (char *)malloc(ins->data.const_string.length + 1);
+            if (!s) {
+                free(labels);
+                free(stack);
+                free(locals);
+                return -1;
+            }
+            memcpy(s, ins->data.const_string.bytes, ins->data.const_string.length);
+            s[ins->data.const_string.length] = '\0';
+            v.type = CC_TYPE_PTR;
+            v.bits = (uint64_t)(uintptr_t)s;
+            v.is_unsigned = 1;
+            stack[sp++] = v;
+            break;
+        }
+        case CC_INSTR_LOAD_PARAM: {
+            uint32_t idx = ins->data.param.index;
+            if (idx >= arg_count) {
+                fprintf(stderr, "cvm: load_param out of range in %s\n", fn->name);
+                goto fail;
+            }
+            stack[sp++] = args[idx];
+            break;
+        }
+        case CC_INSTR_LOAD_LOCAL: {
+            uint32_t idx = ins->data.local.index;
+            if (idx >= fn->local_count) {
+                fprintf(stderr, "cvm: load_local out of range in %s\n", fn->name);
+                goto fail;
+            }
+            stack[sp++] = locals[idx];
+            break;
+        }
+        case CC_INSTR_STORE_LOCAL: {
+            uint32_t idx = ins->data.local.index;
+            if (idx >= fn->local_count || sp == 0) {
+                fprintf(stderr, "cvm: store_local invalid in %s\n", fn->name);
+                goto fail;
+            }
+            locals[idx] = stack[--sp];
+            break;
+        }
+        case CC_INSTR_LOAD_GLOBAL: {
+            GlobalSlot *g = find_global_slot(vm, ins->data.global.symbol);
+            if (!g) {
+                fprintf(stderr, "cvm: unknown global '%s'\n", ins->data.global.symbol);
+                goto fail;
+            }
+            stack[sp++] = g->value;
+            break;
+        }
+        case CC_INSTR_STORE_GLOBAL: {
+            GlobalSlot *g = find_global_slot(vm, ins->data.global.symbol);
+            if (!g || sp == 0) {
+                fprintf(stderr, "cvm: invalid store_global '%s'\n", ins->data.global.symbol);
+                goto fail;
+            }
+            g->value = stack[--sp];
+            break;
+        }
+        case CC_INSTR_BINOP: {
+            if (sp < 2) {
+                goto fail;
+            }
+            VMValue rhs = stack[--sp];
+            VMValue lhs = stack[--sp];
+            VMValue out;
+            memset(&out, 0, sizeof(out));
+            out.type = lhs.type;
+            out.is_unsigned = ins->data.binop.is_unsigned;
+
+            if (lhs.type == CC_TYPE_F64 || rhs.type == CC_TYPE_F64) {
+                double a = bits_to_f64(lhs.bits);
+                double b = bits_to_f64(rhs.bits);
+                double r = 0.0;
+                switch (ins->data.binop.op) {
+                case CC_BINOP_ADD:
+                    r = a + b;
+                    break;
+                case CC_BINOP_SUB:
+                    r = a - b;
+                    break;
+                case CC_BINOP_MUL:
+                    r = a * b;
+                    break;
+                case CC_BINOP_DIV:
+                    r = a / b;
+                    break;
+                default:
+                    fprintf(stderr, "cvm: unsupported float binop in %s\n", fn->name);
+                    goto fail;
+                }
+                out.type = CC_TYPE_F64;
+                out.bits = f64_to_bits(r);
+            } else {
+                uint64_t a = as_u64(lhs);
+                uint64_t b = as_u64(rhs);
+                uint64_t r = 0;
+                switch (ins->data.binop.op) {
+                case CC_BINOP_ADD:
+                    r = a + b;
+                    break;
+                case CC_BINOP_SUB:
+                    r = a - b;
+                    break;
+                case CC_BINOP_MUL:
+                    r = a * b;
+                    break;
+                case CC_BINOP_DIV:
+                    r = b ? (ins->data.binop.is_unsigned ? (a / b) : (uint64_t)((int64_t)a / (int64_t)b)) : 0;
+                    break;
+                case CC_BINOP_MOD:
+                    r = b ? (ins->data.binop.is_unsigned ? (a % b) : (uint64_t)((int64_t)a % (int64_t)b)) : 0;
+                    break;
+                case CC_BINOP_AND:
+                    r = a & b;
+                    break;
+                case CC_BINOP_OR:
+                    r = a | b;
+                    break;
+                case CC_BINOP_XOR:
+                    r = a ^ b;
+                    break;
+                case CC_BINOP_SHL:
+                    r = a << (b & 63u);
+                    break;
+                case CC_BINOP_SHR:
+                    r = ins->data.binop.is_unsigned ? (a >> (b & 63u)) : (uint64_t)((int64_t)a >> (b & 63u));
+                    break;
+                }
+                out.bits = r;
+            }
+            stack[sp++] = out;
+            break;
+        }
+        case CC_INSTR_COMPARE: {
+            if (sp < 2) {
+                goto fail;
+            }
+            VMValue rhs = stack[--sp];
+            VMValue lhs = stack[--sp];
+            int result = 0;
+            if (lhs.type == CC_TYPE_F64 || rhs.type == CC_TYPE_F64) {
+                double a = bits_to_f64(lhs.bits);
+                double b = bits_to_f64(rhs.bits);
+                switch (ins->data.compare.op) {
+                case CC_COMPARE_EQ:
+                    result = (a == b);
+                    break;
+                case CC_COMPARE_NE:
+                    result = (a != b);
+                    break;
+                case CC_COMPARE_LT:
+                    result = (a < b);
+                    break;
+                case CC_COMPARE_LE:
+                    result = (a <= b);
+                    break;
+                case CC_COMPARE_GT:
+                    result = (a > b);
+                    break;
+                case CC_COMPARE_GE:
+                    result = (a >= b);
+                    break;
+                }
+            } else {
+                uint64_t a = as_u64(lhs);
+                uint64_t b = as_u64(rhs);
+                switch (ins->data.compare.op) {
+                case CC_COMPARE_EQ:
+                    result = (a == b);
+                    break;
+                case CC_COMPARE_NE:
+                    result = (a != b);
+                    break;
+                case CC_COMPARE_LT:
+                    result = ins->data.compare.is_unsigned ? (a < b) : ((int64_t)a < (int64_t)b);
+                    break;
+                case CC_COMPARE_LE:
+                    result = ins->data.compare.is_unsigned ? (a <= b) : ((int64_t)a <= (int64_t)b);
+                    break;
+                case CC_COMPARE_GT:
+                    result = ins->data.compare.is_unsigned ? (a > b) : ((int64_t)a > (int64_t)b);
+                    break;
+                case CC_COMPARE_GE:
+                    result = ins->data.compare.is_unsigned ? (a >= b) : ((int64_t)a >= (int64_t)b);
+                    break;
+                }
+            }
+            VMValue out;
+            out.bits = (uint64_t)(result ? 1 : 0);
+            out.type = CC_TYPE_I1;
+            out.is_unsigned = 1;
+            stack[sp++] = out;
+            break;
+        }
+        case CC_INSTR_CONVERT: {
+            if (sp < 1) {
+                goto fail;
+            }
+            VMValue in = stack[--sp];
+            VMValue out = in;
+            if (ins->data.convert.to_type == CC_TYPE_F64 || ins->data.convert.to_type == CC_TYPE_F32) {
+                out.type = CC_TYPE_F64;
+                out.bits = f64_to_bits((double)as_i64(in));
+            } else if (in.type == CC_TYPE_F64) {
+                out.bits = (uint64_t)bits_to_f64(in.bits);
+                out.type = ins->data.convert.to_type;
+            } else {
+                out.type = ins->data.convert.to_type;
+            }
+            stack[sp++] = out;
+            break;
+        }
+        case CC_INSTR_DUP: {
+            if (sp < 1) {
+                goto fail;
+            }
+            stack[sp] = stack[sp - 1];
+            ++sp;
+            break;
+        }
+        case CC_INSTR_DROP: {
+            if (sp < 1) {
+                goto fail;
+            }
+            --sp;
+            break;
+        }
+        case CC_INSTR_LABEL:
+            break;
+        case CC_INSTR_JUMP: {
+            size_t target = 0;
+            if (label_index(labels, label_count, ins->data.jump.target, &target) != 0) {
+                fprintf(stderr, "cvm: unknown label '%s'\n", ins->data.jump.target);
+                goto fail;
+            }
+            ip = target;
+            break;
+        }
+        case CC_INSTR_BRANCH: {
+            if (sp < 1) {
+                goto fail;
+            }
+            VMValue cond = stack[--sp];
+            const char *dst = cond.bits ? ins->data.branch.true_target : ins->data.branch.false_target;
+            size_t target = 0;
+            if (label_index(labels, label_count, dst, &target) != 0) {
+                fprintf(stderr, "cvm: unknown label '%s'\n", dst);
+                goto fail;
+            }
+            ip = target;
+            break;
+        }
+        case CC_INSTR_CALL: {
+            size_t argc = ins->data.call.arg_count;
+            if (sp < argc) {
+                goto fail;
+            }
+            VMValue *argv = (VMValue *)calloc(argc ? argc : 1, sizeof(VMValue));
+            if (!argv) {
+                goto fail;
+            }
+            for (size_t i = 0; i < argc; ++i) {
+                argv[argc - 1 - i] = stack[--sp];
+            }
+
+            uint64_t builtin_raw = 0;
+            int handled_builtin = call_builtin_symbol(ins->data.call.symbol, argv, argc, &builtin_raw);
+            if (handled_builtin) {
+                free(argv);
+                if (ins->data.call.return_type != CC_TYPE_VOID) {
+                    VMValue retv;
+                    retv.bits = builtin_raw;
+                    retv.type = ins->data.call.return_type;
+                    retv.is_unsigned = 0;
+                    stack[sp++] = retv;
+                }
+                break;
+            }
+
+            RuntimeModule *target_owner = NULL;
+            const CCFunction *callee = find_function(vm, ins->data.call.symbol, &target_owner);
+            if (callee) {
+                VMValue retv;
+                int call_has_ret = 0;
+                int rc = execute_function(vm, target_owner, callee, argv, argc, &retv, &call_has_ret);
+                free(argv);
+                if (rc != 0) {
+                    goto fail;
+                }
+                if (call_has_ret && callee->return_type != CC_TYPE_VOID) {
+                    stack[sp++] = retv;
+                }
+            } else {
+                uint64_t call_args[8];
+                if (argc > 8) {
+                    fprintf(stderr, "cvm: extern call '%s' exceeds 8 args\n", ins->data.call.symbol);
+                    free(argv);
+                    goto fail;
+                }
+                for (size_t i = 0; i < argc; ++i) {
+                    call_args[i] = argv[i].bits;
+                }
+
+                uint64_t raw = 0;
+                void *sym = resolve_extern_symbol(vm, ins->data.call.symbol);
+                if (!sym) {
+                    free(argv);
+                    fprintf(stderr, "cvm: unresolved extern '%s'\n", ins->data.call.symbol);
+                    goto fail;
+                }
+                raw = call_c_u64(sym, call_args, argc);
+                free(argv);
+                if (ins->data.call.return_type != CC_TYPE_VOID) {
+                    VMValue retv;
+                    retv.bits = raw;
+                    retv.type = ins->data.call.return_type;
+                    retv.is_unsigned = 0;
+                    stack[sp++] = retv;
+                }
+            }
+            break;
+        }
+        case CC_INSTR_RET: {
+            if (ins->data.ret.has_value) {
+                if (sp < 1) {
+                    goto fail;
+                }
+                *out_ret = stack[--sp];
+                *has_ret = 1;
+            } else {
+                *has_ret = 0;
+            }
+            free(labels);
+            free(stack);
+            free(locals);
+            return 0;
+        }
+        case CC_INSTR_COMMENT:
+            break;
+        default:
+            fprintf(stderr, "cvm: unsupported instruction kind %d in %s\n", (int)ins->kind, fn->name);
+            goto fail;
+        }
+
+        if (sp >= 8192) {
+            fprintf(stderr, "cvm: stack overflow in %s\n", fn->name);
+            goto fail;
+        }
+    }
+
+    *has_ret = 0;
+    free(labels);
+    free(stack);
+    free(locals);
+    return 0;
+
+fail:
+    free(labels);
+    free(stack);
+    free(locals);
+    return -1;
+}
+
+static int write_temp_file(const uint8_t *data, size_t size, char *out_path, size_t out_path_sz) {
+    const char *tmpl = "/tmp/cvm_ccbin_XXXXXX";
+    if (strlen(tmpl) + 1 > out_path_sz) {
+        return -1;
+    }
+    strcpy(out_path, tmpl);
+    int fd = mkstemp(out_path);
+    if (fd < 0) {
+        return -1;
+    }
+    size_t off = 0;
+    while (off < size) {
+        ssize_t n = write(fd, data + off, size - off);
+        if (n <= 0) {
+            close(fd);
+            unlink(out_path);
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    close(fd);
+    return 0;
+}
+
+static int load_runtime_modules(CVM *vm, const CclibFile *lib) {
+    for (uint32_t i = 0; i < lib->module_count; ++i) {
+        const CclibModule *cm = &lib->modules[i];
+        if (!cm->ccbin_data || cm->ccbin_size == 0) {
+            if (vm->verbose) {
+                fprintf(stderr, "cvm: cclib module '%s' has no embedded ccbin payload\n",
+                        cm->module_name ? cm->module_name : "<unnamed>");
+            }
+            continue;
+        }
+
+        RuntimeModule rm;
+        memset(&rm, 0, sizeof(rm));
+        rm.name = cm->module_name ? strdup(cm->module_name) : NULL;
+        if (cm->module_name && !rm.name) {
+            return -1;
+        }
+        cc_module_init(&rm.module, 0);
+        rm.ccbin_data = NULL;
+        rm.ccbin_size = 0;
+
+        if (cm->ccbin_data && cm->ccbin_size > 0) {
+            rm.ccbin_data = (uint8_t *)malloc(cm->ccbin_size);
+            if (!rm.ccbin_data) {
+                return -1;
+            }
+            memcpy(rm.ccbin_data, cm->ccbin_data, cm->ccbin_size);
+            rm.ccbin_size = cm->ccbin_size;
+        }
+
+        char tmp_path[128];
+        if (write_temp_file(cm->ccbin_data, cm->ccbin_size, tmp_path, sizeof(tmp_path)) != 0) {
+            fprintf(stderr, "cvm: failed to materialize ccbin for module %s\n", cm->module_name ? cm->module_name : "<unnamed>");
+            return -1;
+        }
+
+        CCDiagnosticSink sink;
+        cc_diag_init_default(&sink);
+        if (!cc_load_file(tmp_path, &rm.module, &sink)) {
+            unlink(tmp_path);
+            fprintf(stderr, "cvm: failed loading module ccbin for %s\n", cm->module_name ? cm->module_name : "<unnamed>");
+            cc_module_free(&rm.module);
+            return -1;
+        }
+        unlink(tmp_path);
+
+        rm.global_count = rm.module.global_count;
+        if (rm.global_count > 0) {
+            rm.globals = (GlobalSlot *)calloc(rm.global_count, sizeof(GlobalSlot));
+            if (!rm.globals) {
+                cc_module_free(&rm.module);
+                return -1;
+            }
+            for (size_t g = 0; g < rm.global_count; ++g) {
+                CCGlobal *src = &rm.module.globals[g];
+                rm.globals[g].name = src->name;
+                rm.globals[g].value.type = src->type;
+                rm.globals[g].value.is_unsigned = 0;
+                rm.globals[g].owns_ptr = 0;
+                switch (src->init.kind) {
+                case CC_GLOBAL_INIT_INT:
+                    rm.globals[g].value.bits = src->init.payload.u64;
+                    break;
+                case CC_GLOBAL_INIT_FLOAT:
+                    rm.globals[g].value.type = CC_TYPE_F64;
+                    rm.globals[g].value.bits = f64_to_bits(src->init.payload.f64);
+                    break;
+                case CC_GLOBAL_INIT_STRING: {
+                    char *s = (char *)malloc(src->init.payload.string.length + 1);
+                    if (!s) {
+                        cc_module_free(&rm.module);
+                        free(rm.globals);
+                        return -1;
+                    }
+                    memcpy(s, src->init.payload.string.data, src->init.payload.string.length);
+                    s[src->init.payload.string.length] = '\0';
+                    rm.globals[g].value.type = CC_TYPE_PTR;
+                    rm.globals[g].value.bits = (uint64_t)(uintptr_t)s;
+                    rm.globals[g].owns_ptr = 1;
+                    break;
+                }
+                case CC_GLOBAL_INIT_BYTES:
+                    rm.globals[g].value.type = CC_TYPE_PTR;
+                    rm.globals[g].value.bits = (uint64_t)(uintptr_t)src->init.payload.bytes.data;
+                    break;
+                case CC_GLOBAL_INIT_NONE:
+                default:
+                    rm.globals[g].value.bits = 0;
+                    break;
+                }
+            }
+        }
+
+        size_t next = vm->mod_count + 1;
+        RuntimeModule *grown = (RuntimeModule *)realloc(vm->mods, next * sizeof(RuntimeModule));
+        if (!grown) {
+            cc_module_free(&rm.module);
+            free(rm.globals);
+            free((char *)rm.name);
+            free(rm.ccbin_data);
+            return -1;
+        }
+        vm->mods = grown;
+        vm->mods[vm->mod_count] = rm;
+        RuntimeModule *installed = &vm->mods[vm->mod_count];
+        vm->mod_count = next;
+
+        for (size_t fi = 0; fi < installed->module.function_count; ++fi) {
+            const CCFunction *ccfn = &installed->module.functions[fi];
+            if (ccfn->name) {
+                if (add_func_alias(vm, ccfn->name, installed, ccfn) != 0) {
+                    return -1;
+                }
+            }
+        }
+
+        for (uint32_t fi = 0; fi < cm->function_count; ++fi) {
+            const CclibFunction *meta_fn = &cm->functions[fi];
+            if (!meta_fn->backend_name || !meta_fn->name) {
+                continue;
+            }
+            const CCFunction *matched = NULL;
+            for (size_t cfi = 0; cfi < installed->module.function_count; ++cfi) {
+                const CCFunction *ccfn = &installed->module.functions[cfi];
+                if (!ccfn->name) {
+                    continue;
+                }
+                if (symbol_equivalent(ccfn->name, meta_fn->backend_name) ||
+                    symbol_equivalent(ccfn->name, meta_fn->name)) {
+                    matched = ccfn;
+                    break;
+                }
+            }
+
+            if (matched) {
+                if (add_func_alias(vm, meta_fn->backend_name, installed, matched) != 0) {
+                    return -1;
+                }
+                if (add_func_alias(vm, meta_fn->name, installed, matched) != 0) {
+                    return -1;
+                }
+            }
+        }
+
+        if (vm->verbose) {
+            fprintf(stderr, "cvm: loaded module '%s' functions=%zu aliases=%zu\n",
+                    installed->name ? installed->name : "<unnamed>",
+                    installed->module.function_count,
+                    vm->alias_count);
+        }
+    }
+
+    return 0;
+}
+
+static int load_cclib_modules_from_file(CVM *vm, const char *path) {
+    CclibFile lib;
+    memset(&lib, 0, sizeof(lib));
+    int err = cclib_read(path, &lib);
+    if (err != 0) {
+        return err;
+    }
+
+    int rc = load_runtime_modules(vm, &lib);
+    cclib_free(&lib);
+    return rc == 0 ? 0 : EIO;
+}
+
+static int file_exists(const char *path) {
+    return path && access(path, R_OK) == 0;
+}
+
+static void path_dirname_from(const char *path, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!path || !*path) {
+        return;
+    }
+
+    const char *slash = strrchr(path, '/');
+    if (!slash) {
+        return;
+    }
+    size_t n = (size_t)(slash - path);
+    if (n == 0 || n + 1 >= out_sz) {
+        return;
+    }
+    memcpy(out, path, n);
+    out[n] = '\0';
+}
+
+static int get_executable_dir(const char *program_path, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) {
+        return -1;
+    }
+    out[0] = '\0';
+
+#if defined(__APPLE__)
+    uint32_t sz = (uint32_t)out_sz;
+    if (_NSGetExecutablePath(out, &sz) == 0) {
+        char dir[1024];
+        path_dirname_from(out, dir, sizeof(dir));
+        if (dir[0] != '\0') {
+            strncpy(out, dir, out_sz - 1);
+            out[out_sz - 1] = '\0';
+            return 0;
+        }
+    }
+#elif defined(__linux__)
+    ssize_t n = readlink("/proc/self/exe", out, out_sz - 1);
+    if (n > 0) {
+        out[n] = '\0';
+        char dir[1024];
+        path_dirname_from(out, dir, sizeof(dir));
+        if (dir[0] != '\0') {
+            strncpy(out, dir, out_sz - 1);
+            out[out_sz - 1] = '\0';
+            return 0;
+        }
+    }
+#endif
+
+    if (program_path && strchr(program_path, '/')) {
+        path_dirname_from(program_path, out, out_sz);
+        if (out[0] != '\0') {
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int try_load_cclib_candidate(CVM *vm, const char *path, int verbose) {
+    if (!file_exists(path)) {
+        return 0;
+    }
+    int rc = load_cclib_modules_from_file(vm, path);
+    if (rc != 0) {
+        fprintf(stderr, "cvm: failed to load cclib '%s' (%d)\n", path, rc);
+        return -1;
+    }
+    if (verbose) {
+        fprintf(stderr, "cvm: loaded cclib '%s'\n", path);
+    }
+    return 0;
+}
+
+static int load_default_cclib_imports(CVM *vm, const CVMOptions *options) {
+    char exe_dir[1024];
+    char candidate[1200];
+
+    if (get_executable_dir(options->program_path, exe_dir, sizeof(exe_dir)) == 0) {
+        snprintf(candidate, sizeof(candidate), "%s/stdlib.cclib", exe_dir);
+        if (try_load_cclib_candidate(vm, candidate, options->verbose) != 0) {
+            return -1;
+        }
+
+        snprintf(candidate, sizeof(candidate), "%s/runtime.cclib", exe_dir);
+        if (try_load_cclib_candidate(vm, candidate, options->verbose) != 0) {
+            return -1;
+        }
+    }
+
+    if (try_load_cclib_candidate(vm, "/usr/local/share/chance/stdlib/stdlib.cclib", options->verbose) != 0) {
+        return -1;
+    }
+    if (try_load_cclib_candidate(vm, "/usr/local/share/chance/runtime/runtime.cclib", options->verbose) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int resolve_tool_path(const char *env_name, const char *exe_name, char *out, size_t out_sz) {
+    const char *env = getenv(env_name);
+    if (env && *env) {
+        if (access(env, X_OK) == 0) {
+            snprintf(out, out_sz, "%s", env);
+            return 0;
+        }
+        char candidate[1024];
+        snprintf(candidate, sizeof(candidate), "%s/%s", env, exe_name);
+        if (access(candidate, X_OK) == 0) {
+            snprintf(out, out_sz, "%s", candidate);
+            return 0;
+        }
+    }
+
+    const char *common_prefixes[] = {
+        "/usr/local/bin",
+        "/opt/homebrew/bin",
+        "/usr/bin"
+    };
+
+    for (size_t i = 0; i < (sizeof(common_prefixes) / sizeof(common_prefixes[0])); ++i) {
+        char candidate[1024];
+        snprintf(candidate, sizeof(candidate), "%s/%s", common_prefixes[i], exe_name);
+        if (access(candidate, X_OK) == 0) {
+            snprintf(out, out_sz, "%s", candidate);
+            return 0;
+        }
+    }
+
+    snprintf(out, out_sz, "%s", exe_name);
+    return 0;
+}
+
+static int run_cmdv(const char *const *argv, int verbose) {
+    if (!argv || !argv[0]) {
+        return -1;
+    }
+
+    if (verbose) {
+        fprintf(stderr, "cvm[jit]:");
+        for (size_t i = 0; argv[i]; ++i) {
+            fprintf(stderr, " %s", argv[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        return -1;
+    }
+    if (pid == 0) {
+        execvp(argv[0], (char *const *)argv);
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        return -1;
+    }
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        return 0;
+    }
+    return -1;
+}
+
+static int run_cmd_capture_exit(const char *const *argv, int verbose, int *exit_code) {
+    if (!argv || !argv[0] || !exit_code) {
+        return -1;
+    }
+
+    if (verbose) {
+        fprintf(stderr, "cvm[jit]:");
+        for (size_t i = 0; argv[i]; ++i) {
+            fprintf(stderr, " %s", argv[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        return -1;
+    }
+    if (pid == 0) {
+        execvp(argv[0], (char *const *)argv);
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        return -1;
+    }
+    if (WIFEXITED(status)) {
+        *exit_code = WEXITSTATUS(status);
+        return 0;
+    }
+    return -1;
+}
+
+static int locate_support_ccb(const CVMOptions *options, const char *name, char *out, size_t out_sz) {
+    char exe_dir[1024];
+    if (get_executable_dir(options->program_path, exe_dir, sizeof(exe_dir)) == 0) {
+        snprintf(out, out_sz, "%s/%s", exe_dir, name);
+        if (file_exists(out)) {
+            return 0;
+        }
+    }
+
+    if (strcmp(name, "stdlib.ccb") == 0) {
+        snprintf(out, out_sz, "/usr/local/share/chance/stdlib/stdlib.ccb");
+        if (file_exists(out)) {
+            return 0;
+        }
+    } else if (strcmp(name, "runtime.ccb") == 0) {
+        snprintf(out, out_sz, "/usr/local/share/chance/runtime/runtime.ccb");
+        if (file_exists(out)) {
+            return 0;
+        }
+    }
+
+    for (int i = 0; i < options->cclib_import_count; ++i) {
+        const char *cclib = options->cclib_imports[i];
+        if (!cclib) {
+            continue;
+        }
+        char candidate[1200];
+        snprintf(candidate, sizeof(candidate), "%s", cclib);
+        char *dot = strrchr(candidate, '.');
+        if (dot && strcmp(dot, ".cclib") == 0) {
+            strcpy(dot, ".ccb");
+            if (file_exists(candidate) && strstr(candidate, name) != NULL) {
+                snprintf(out, out_sz, "%s", candidate);
+                return 0;
+            }
+        }
+    }
+
+    out[0] = '\0';
+    return -1;
+}
+
+static void free_path_list(char **paths, size_t count) {
+    if (!paths) {
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        free(paths[i]);
+    }
+    free(paths);
+}
+
+static int append_path_list(char ***out_paths, size_t *out_count, const char *path) {
+    if (!out_paths || !out_count || !path || !*path) {
+        return -1;
+    }
+
+    char *copy = strdup(path);
+    if (!copy) {
+        return -1;
+    }
+
+    size_t next = *out_count + 1;
+    char **grown = (char **)realloc(*out_paths, next * sizeof(char *));
+    if (!grown) {
+        free(copy);
+        return -1;
+    }
+    *out_paths = grown;
+    (*out_paths)[*out_count] = copy;
+    *out_count = next;
+    return 0;
+}
+
+static void sanitize_name(const char *in, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) {
+        return;
+    }
+    if (!in) {
+        out[0] = '\0';
+        return;
+    }
+    size_t oi = 0;
+    for (size_t i = 0; in[i] != '\0' && oi + 1 < out_sz; ++i) {
+        char ch = in[i];
+        if ((ch >= 'a' && ch <= 'z') ||
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') ||
+            ch == '_') {
+            out[oi++] = ch;
+        } else {
+            out[oi++] = '_';
+        }
+    }
+    out[oi] = '\0';
+}
+
+static int locate_default_cclib_path(const CVMOptions *options, const char *name, char *out, size_t out_sz) {
+    if (!options || !name || !out || out_sz == 0) {
+        return -1;
+    }
+
+    char exe_dir[1024];
+    if (get_executable_dir(options->program_path, exe_dir, sizeof(exe_dir)) == 0) {
+        snprintf(out, out_sz, "%s/%s", exe_dir, name);
+        if (file_exists(out)) {
+            return 0;
+        }
+    }
+
+    if (strcmp(name, "stdlib.cclib") == 0) {
+        snprintf(out, out_sz, "/usr/local/share/chance/stdlib/stdlib.cclib");
+        if (file_exists(out)) {
+            return 0;
+        }
+    } else if (strcmp(name, "runtime.cclib") == 0) {
+        snprintf(out, out_sz, "/usr/local/share/chance/runtime/runtime.cclib");
+        if (file_exists(out)) {
+            return 0;
+        }
+    }
+
+    out[0] = '\0';
+    return -1;
+}
+
+static int compile_cclib_modules_to_objects(const char *cclib_path,
+                                            const char *tag,
+                                            const char *temp_dir,
+                                            const char *chancecodec_tool,
+                                            const char *backend,
+                                            const char *chs_tool,
+                                            const char *chs_arch,
+                                            const char *chs_format,
+                                            int verbose,
+                                            char ***out_paths,
+                                            size_t *out_count) {
+    if (!cclib_path || !tag || !temp_dir || !chancecodec_tool || !chs_tool || !chs_arch || !chs_format || !out_paths || !out_count) {
+        return -1;
+    }
+
+    CclibFile lib;
+    memset(&lib, 0, sizeof(lib));
+    if (cclib_read(cclib_path, &lib) != 0) {
+        return -1;
+    }
+
+    for (uint32_t mi = 0; mi < lib.module_count; ++mi) {
+        const CclibModule *m = &lib.modules[mi];
+        if (!m->ccbin_data || m->ccbin_size == 0) {
+            continue;
+        }
+
+        char temp_ccbin[128];
+        if (write_temp_file(m->ccbin_data, m->ccbin_size, temp_ccbin, sizeof(temp_ccbin)) != 0) {
+            cclib_free(&lib);
+            return -1;
+        }
+
+        char mod_name[256];
+        sanitize_name(m->module_name ? m->module_name : "mod", mod_name, sizeof(mod_name));
+
+        char out_s[1400];
+        char out_o[1400];
+        snprintf(out_s, sizeof(out_s), "%s/%s_%u_%s.s", temp_dir, tag, mi, mod_name);
+        snprintf(out_o, sizeof(out_o), "%s/%s_%u_%s.o", temp_dir, tag, mi, mod_name);
+
+        const char *cc_argv[8];
+        size_t cca = 0;
+        cc_argv[cca++] = chancecodec_tool;
+        cc_argv[cca++] = temp_ccbin;
+        if (backend) {
+            cc_argv[cca++] = "--backend";
+            cc_argv[cca++] = backend;
+        }
+        cc_argv[cca++] = "--output";
+        cc_argv[cca++] = out_s;
+        cc_argv[cca] = NULL;
+        if (run_cmdv(cc_argv, verbose) != 0) {
+            unlink(temp_ccbin);
+            cclib_free(&lib);
+            return -1;
+        }
+        rewrite_jit_asm_symbols(out_s);
+
+        const char *chs_argv[] = {
+            chs_tool,
+            "--arch",
+            chs_arch,
+            "--format",
+            chs_format,
+            "--output",
+            out_o,
+            out_s,
+            NULL
+        };
+        if (run_cmdv(chs_argv, verbose) != 0) {
+            unlink(temp_ccbin);
+            cclib_free(&lib);
+            return -1;
+        }
+
+        if (append_path_list(out_paths, out_count, out_o) != 0) {
+            unlink(temp_ccbin);
+            cclib_free(&lib);
+            return -1;
+        }
+
+        unlink(temp_ccbin);
+    }
+
+    cclib_free(&lib);
+    return 0;
+}
+
+static char *replace_all_alloc(const char *src, const char *from, const char *to, int *changed) {
+    if (!src || !from || !to || !changed) {
+        return NULL;
+    }
+    *changed = 0;
+
+    size_t src_len = strlen(src);
+    size_t from_len = strlen(from);
+    size_t to_len = strlen(to);
+    if (from_len == 0) {
+        return strdup(src);
+    }
+
+    size_t count = 0;
+    const char *p = src;
+    while ((p = strstr(p, from)) != NULL) {
+        if (strncmp(p, to, to_len) == 0) {
+            p += from_len;
+            continue;
+        }
+        count++;
+        p += from_len;
+    }
+
+    if (count == 0) {
+        return strdup(src);
+    }
+
+    size_t out_len = src_len + count * (to_len - from_len);
+    char *out = (char *)malloc(out_len + 1);
+    if (!out) {
+        return NULL;
+    }
+
+    const char *cur = src;
+    char *dst = out;
+    while ((p = strstr(cur, from)) != NULL) {
+        if (strncmp(p, to, to_len) == 0) {
+            size_t n = (size_t)(p - cur) + from_len;
+            memcpy(dst, cur, n);
+            dst += n;
+            cur = p + from_len;
+            continue;
+        }
+
+        size_t n = (size_t)(p - cur);
+        memcpy(dst, cur, n);
+        dst += n;
+        memcpy(dst, to, to_len);
+        dst += to_len;
+        cur = p + from_len;
+        *changed = 1;
+    }
+
+    size_t tail = strlen(cur);
+    memcpy(dst, cur, tail);
+    dst += tail;
+    *dst = '\0';
+    return out;
+}
+
+static int rewrite_jit_asm_symbols(const char *asm_path) {
+    if (!asm_path || !*asm_path) {
+        return -1;
+    }
+
+    FILE *f = fopen(asm_path, "rb");
+    if (!f) {
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return -1;
+    }
+    long sz = ftell(f);
+    if (sz < 0) {
+        fclose(f);
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return -1;
+    }
+
+    size_t len = (size_t)sz;
+    char *buf = (char *)malloc(len + 1);
+    if (!buf) {
+        fclose(f);
+        return -1;
+    }
+    size_t got = fread(buf, 1, len, f);
+    fclose(f);
+    if (got != len) {
+        free(buf);
+        return -1;
+    }
+    buf[len] = '\0';
+
+    int changed = 0;
+    int pass_changed = 0;
+    char *rewritten = replace_all_alloc(buf,
+                                        "Std_IO_printnl_ptr_to_char",
+                                        "Std_IO_printnl_ptr_to_char_varargs",
+                                        &pass_changed);
+    free(buf);
+    if (!rewritten) {
+        return -1;
+    }
+    if (pass_changed) {
+        changed = 1;
+    }
+
+    if (changed) {
+        FILE *out = fopen(asm_path, "wb");
+        if (!out) {
+            free(rewritten);
+            return -1;
+        }
+        size_t out_len = strlen(rewritten);
+        if (fwrite(rewritten, 1, out_len, out) != out_len) {
+            fclose(out);
+            free(rewritten);
+            return -1;
+        }
+        fclose(out);
+    }
+
+    free(rewritten);
+    return 0;
+}
+
+static int run_jit_from_ccbin_entry(const uint8_t *ccbin_data,
+                                    size_t ccbin_size,
+                                    const char *entry_symbol,
+                                    int function_only,
+                                    const CVMOptions *options,
+                                    int *exit_code) {
+    if (!ccbin_data || ccbin_size == 0 || !entry_symbol || !*entry_symbol || !options || !exit_code) {
+        return -1;
+    }
+
+    char temp_ccbin[128];
+    if (write_temp_file(ccbin_data, ccbin_size, temp_ccbin, sizeof(temp_ccbin)) != 0) {
+        return -1;
+    }
+
+    char temp_dir[] = "/tmp/cvm_jit_XXXXXX";
+    if (!mkdtemp(temp_dir)) {
+        unlink(temp_ccbin);
+        return -1;
+    }
+
+    char chancecodec_tool[1024];
+    char chancec_tool[1024];
+    char cld_tool[1024];
+    char chs_tool[1024];
+    resolve_tool_path("CHANCEC_HOME", "chancec", chancec_tool, sizeof(chancec_tool));
+    resolve_tool_path("CHANCECODEC_HOME", "chancecodec", chancecodec_tool, sizeof(chancecodec_tool));
+    resolve_tool_path("CLD_HOME", "cld", cld_tool, sizeof(cld_tool));
+    resolve_tool_path("CHS_HOME", "chs", chs_tool, sizeof(chs_tool));
+    if (options->verbose) {
+        fprintf(stderr, "cvm[jit]: tools chancec=%s chancecodec=%s cld=%s chs=%s\n",
+                chancec_tool,
+                chancecodec_tool,
+                cld_tool,
+                chs_tool);
+    }
+
+    const char *backend = NULL;
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+    backend = "arm64-macos";
+#elif defined(__APPLE__) && defined(__x86_64__)
+    backend = "x86-gas";
+#elif defined(__linux__) && defined(__x86_64__)
+    backend = "x86-gas";
+#elif defined(__linux__) && defined(__aarch64__)
+    backend = "arm64-elf";
+#endif
+
+    char main_s[1200];
+    snprintf(main_s, sizeof(main_s), "%s/main.s", temp_dir);
+
+    char function_opt[1152];
+    const char *cc_argv[10];
+    size_t cca = 0;
+    cc_argv[cca++] = chancecodec_tool;
+    cc_argv[cca++] = temp_ccbin;
+    if (backend) {
+        cc_argv[cca++] = "--backend";
+        cc_argv[cca++] = backend;
+    }
+    if (function_only && entry_symbol && *entry_symbol) {
+        snprintf(function_opt, sizeof(function_opt), "function=%s", entry_symbol);
+        cc_argv[cca++] = "--option";
+        cc_argv[cca++] = function_opt;
+    }
+    cc_argv[cca++] = "--output";
+    cc_argv[cca++] = main_s;
+    cc_argv[cca] = NULL;
+    if (run_cmdv(cc_argv, options->verbose) != 0) {
+        unlink(temp_ccbin);
+        return -1;
+    }
+    rewrite_jit_asm_symbols(main_s);
+
+    const char *chs_arch = NULL;
+    const char *chs_format = NULL;
+    const char *cld_target = NULL;
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+    chs_arch = "arm64";
+    chs_format = "macho";
+    cld_target = "macos-arm64";
+#elif defined(__linux__) && defined(__x86_64__)
+    chs_arch = "x86_64";
+    chs_format = "elf64";
+    cld_target = "x86_64-elf";
+#endif
+
+    if (!chs_arch || !chs_format || !cld_target) {
+        unlink(temp_ccbin);
+        return -1;
+    }
+
+    char main_o[1200];
+    snprintf(main_o, sizeof(main_o), "%s/main.o", temp_dir);
+
+    const char *chs_main_argv[] = {
+        chs_tool,
+        "--arch",
+        chs_arch,
+        "--format",
+        chs_format,
+        "--output",
+        main_o,
+        main_s,
+        NULL
+    };
+    if (run_cmdv(chs_main_argv, options->verbose) != 0) {
+        unlink(temp_ccbin);
+        return -1;
+    }
+
+    char jit_exe[1200];
+    snprintf(jit_exe, sizeof(jit_exe), "%s/jit_exec", temp_dir);
+
+    char entry_buf[1024];
+    snprintf(entry_buf, sizeof(entry_buf), "%s", entry_symbol ? entry_symbol : "main");
+#if defined(__APPLE__)
+    if (entry_buf[0] != '_') {
+        char prefixed[1024];
+        if (snprintf(prefixed, sizeof(prefixed), "_%s", entry_buf) > 0) {
+            snprintf(entry_buf, sizeof(entry_buf), "%s", prefixed);
+        }
+    }
+#endif
+
+    char **extra_obj_paths = NULL;
+    size_t extra_obj_count = 0;
+
+    char stdlib_cclib[1200];
+    if (locate_default_cclib_path(options, "stdlib.cclib", stdlib_cclib, sizeof(stdlib_cclib)) == 0) {
+        if (compile_cclib_modules_to_objects(stdlib_cclib,
+                                             "jit_stdlib",
+                                             temp_dir,
+                                             chancecodec_tool,
+                                             backend,
+                                             chs_tool,
+                                             chs_arch,
+                                             chs_format,
+                                             options->verbose,
+                                             &extra_obj_paths,
+                                             &extra_obj_count) != 0) {
+            free_path_list(extra_obj_paths, extra_obj_count);
+            unlink(temp_ccbin);
+            return -1;
+        }
+    }
+
+    char runtime_cclib[1200];
+    if (locate_default_cclib_path(options, "runtime.cclib", runtime_cclib, sizeof(runtime_cclib)) == 0) {
+        if (compile_cclib_modules_to_objects(runtime_cclib,
+                                             "jit_runtime",
+                                             temp_dir,
+                                             chancecodec_tool,
+                                             backend,
+                                             chs_tool,
+                                             chs_arch,
+                                             chs_format,
+                                             options->verbose,
+                                             &extra_obj_paths,
+                                             &extra_obj_count) != 0) {
+            free_path_list(extra_obj_paths, extra_obj_count);
+            unlink(temp_ccbin);
+            return -1;
+        }
+    }
+
+    for (int i = 0; i < options->cclib_import_count; ++i) {
+        if (!options->cclib_imports[i]) {
+            continue;
+        }
+        char tag[64];
+        snprintf(tag, sizeof(tag), "jit_import_%d", i);
+        if (compile_cclib_modules_to_objects(options->cclib_imports[i],
+                                             tag,
+                                             temp_dir,
+                                             chancecodec_tool,
+                                             backend,
+                                             chs_tool,
+                                             chs_arch,
+                                             chs_format,
+                                             options->verbose,
+                                             &extra_obj_paths,
+                                             &extra_obj_count) != 0) {
+            free_path_list(extra_obj_paths, extra_obj_count);
+            unlink(temp_ccbin);
+            return -1;
+        }
+    }
+
+    const char *cld_argv[512];
+    size_t cla = 0;
+    cld_argv[cla++] = cld_tool;
+    cld_argv[cla++] = "link";
+    cld_argv[cla++] = main_o;
+    for (size_t oi = 0; oi < extra_obj_count; ++oi) {
+        cld_argv[cla++] = extra_obj_paths[oi];
+    }
+    cld_argv[cla++] = "-o";
+    cld_argv[cla++] = jit_exe;
+    cld_argv[cla++] = "--target";
+    cld_argv[cla++] = cld_target;
+    cld_argv[cla++] = "--entry";
+    cld_argv[cla++] = entry_buf;
+    cld_argv[cla] = NULL;
+
+    if (run_cmdv(cld_argv, options->verbose) != 0) {
+        free_path_list(extra_obj_paths, extra_obj_count);
+        unlink(temp_ccbin);
+        return -1;
+    }
+
+    const char *run_argv[] = {
+        jit_exe,
+        NULL
+    };
+    if (run_cmd_capture_exit(run_argv, options->verbose, exit_code) != 0) {
+        free_path_list(extra_obj_paths, extra_obj_count);
+        unlink(temp_ccbin);
+        return -1;
+    }
+
+    free_path_list(extra_obj_paths, extra_obj_count);
+    unlink(temp_ccbin);
+    return 0;
+}
+
+static int jit_function_seen(CVM *vm, const char *name) {
+    if (!vm || !name || !*name) {
+        return 0;
+    }
+    for (size_t i = 0; i < vm->jit_compiled_count; ++i) {
+        if (strcmp(vm->jit_compiled_functions[i], name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int jit_mark_function(CVM *vm, const char *name) {
+    if (!vm || !name || !*name) {
+        return -1;
+    }
+    size_t next = vm->jit_compiled_count + 1;
+    char **grown = (char **)realloc(vm->jit_compiled_functions, next * sizeof(char *));
+    if (!grown) {
+        return -1;
+    }
+    vm->jit_compiled_functions = grown;
+    vm->jit_compiled_functions[vm->jit_compiled_count] = strdup(name);
+    if (!vm->jit_compiled_functions[vm->jit_compiled_count]) {
+        return -1;
+    }
+    vm->jit_compiled_count = next;
+    return 0;
+}
+
+static int jit_compile_function_once(CVM *vm, RuntimeModule *owner, const CCFunction *fn) {
+    if (!vm || !owner || !fn || !fn->name || !owner->ccbin_data || owner->ccbin_size == 0 || !vm->jit_options) {
+        return -1;
+    }
+    if (jit_function_seen(vm, fn->name)) {
+        return 0;
+    }
+
+    char temp_ccbin[128];
+    if (write_temp_file(owner->ccbin_data, owner->ccbin_size, temp_ccbin, sizeof(temp_ccbin)) != 0) {
+        return -1;
+    }
+
+    char temp_dir[] = "/tmp/cvm_jit_func_XXXXXX";
+    if (!mkdtemp(temp_dir)) {
+        unlink(temp_ccbin);
+        return -1;
+    }
+
+    char chancecodec_tool[1024];
+    char chs_tool[1024];
+    resolve_tool_path("CHANCECODEC_HOME", "chancecodec", chancecodec_tool, sizeof(chancecodec_tool));
+    resolve_tool_path("CHS_HOME", "chs", chs_tool, sizeof(chs_tool));
+
+    const char *backend = NULL;
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+    backend = "arm64-macos";
+#elif defined(__APPLE__) && defined(__x86_64__)
+    backend = "x86-gas";
+#elif defined(__linux__) && defined(__x86_64__)
+    backend = "x86-gas";
+#elif defined(__linux__) && defined(__aarch64__)
+    backend = "arm64-elf";
+#endif
+
+    const char *chs_arch = NULL;
+    const char *chs_format = NULL;
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+    chs_arch = "arm64";
+    chs_format = "macho";
+#elif defined(__linux__) && defined(__x86_64__)
+    chs_arch = "x86_64";
+    chs_format = "elf64";
+#endif
+
+    if (!backend || !chs_arch || !chs_format) {
+        unlink(temp_ccbin);
+        return -1;
+    }
+
+    char out_s[1200];
+    char out_o[1200];
+    char function_opt[1152];
+    snprintf(out_s, sizeof(out_s), "%s/%s.s", temp_dir, fn->name);
+    snprintf(out_o, sizeof(out_o), "%s/%s.o", temp_dir, fn->name);
+    snprintf(function_opt, sizeof(function_opt), "function=%s", fn->name);
+
+    const char *cc_argv[] = {
+        chancecodec_tool,
+        temp_ccbin,
+        "--backend",
+        backend,
+        "--option",
+        function_opt,
+        "--output",
+        out_s,
+        NULL
+    };
+    if (run_cmdv(cc_argv, vm->jit_options->verbose) != 0) {
+        unlink(temp_ccbin);
+        return -1;
+    }
+    rewrite_jit_asm_symbols(out_s);
+
+    const char *chs_argv[] = {
+        chs_tool,
+        "--arch",
+        chs_arch,
+        "--format",
+        chs_format,
+        "--output",
+        out_o,
+        out_s,
+        NULL
+    };
+    if (run_cmdv(chs_argv, vm->jit_options->verbose) != 0) {
+        unlink(temp_ccbin);
+        return -1;
+    }
+
+    if (jit_mark_function(vm, fn->name) != 0) {
+        unlink(temp_ccbin);
+        return -1;
+    }
+    unlink(temp_ccbin);
+    return 0;
+}
+
+static int run_jit_from_cclib(const char *cclib_path, const CVMOptions *options, int *exit_code) {
+    CclibFile lib;
+    memset(&lib, 0, sizeof(lib));
+    if (cclib_read(cclib_path, &lib) != 0) {
+        return -1;
+    }
+
+    const char *entry = options->entry_name ? options->entry_name : "main";
+    const CclibModule *main_mod = NULL;
+    const CclibFunction *main_fn = NULL;
+    for (uint32_t mi = 0; mi < lib.module_count && !main_mod; ++mi) {
+        const CclibModule *m = &lib.modules[mi];
+        if (!m->ccbin_data || m->ccbin_size == 0) {
+            continue;
+        }
+        for (uint32_t fi = 0; fi < m->function_count; ++fi) {
+            const CclibFunction *f = &m->functions[fi];
+            if ((f->name && strcmp(f->name, entry) == 0) ||
+                (f->backend_name && strcmp(f->backend_name, entry) == 0)) {
+                main_mod = m;
+                main_fn = f;
+                break;
+            }
+        }
+    }
+
+    if (!main_mod && strcmp(entry, "main") == 0) {
+        for (uint32_t mi = 0; mi < lib.module_count && !main_mod; ++mi) {
+            const CclibModule *m = &lib.modules[mi];
+            if (!m->ccbin_data || m->ccbin_size == 0) {
+                continue;
+            }
+            for (uint32_t fi = 0; fi < m->function_count; ++fi) {
+                const CclibFunction *f = &m->functions[fi];
+                if (f->name && strcmp(f->name, "__cert__entry_main") == 0) {
+                    main_mod = m;
+                    main_fn = f;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!main_mod) {
+        cclib_free(&lib);
+        return -1;
+    }
+
+    const char *entry_symbol = (main_fn && main_fn->backend_name) ? main_fn->backend_name :
+                               ((main_fn && main_fn->name) ? main_fn->name : entry);
+    int rc = run_jit_from_ccbin_entry(main_mod->ccbin_data,
+                                      main_mod->ccbin_size,
+                                      entry_symbol ? entry_symbol : "main",
+                                      0,
+                                      options,
+                                      exit_code);
+    cclib_free(&lib);
+    return rc;
+}
+
+int cvm_run_file(const char *cclib_path, const CVMOptions *options, int *exit_code) {
+    if (!cclib_path || !options || !exit_code) {
+        return 2;
+    }
+
+    CVM vm;
+    memset(&vm, 0, sizeof(vm));
+    vm.verbose = options->verbose;
+    vm.jit_mode = options->jit_mode;
+    vm.jit_attempted = 0;
+    vm.jit_cclib_path = cclib_path;
+    vm.jit_options = options;
+
+    if (add_import_handle(&vm, "self", 0, dlopen(NULL, RTLD_NOW | RTLD_GLOBAL)) != 0) {
+        return 2;
+    }
+
+    if (add_default_c_runtime_import(&vm) != 0) {
+        free_runtime(&vm);
+        return 2;
+    }
+
+    for (int i = 0; i < options->import_count; ++i) {
+        void *h = dlopen(options->imports[i], RTLD_NOW | RTLD_GLOBAL);
+        if (!h) {
+            fprintf(stderr, "cvm: failed import '%s': %s\n", options->imports[i], dlerror());
+            free_runtime(&vm);
+            return 2;
+        }
+        if (add_import_handle(&vm, options->imports[i], 1, h) != 0) {
+            dlclose(h);
+            free_runtime(&vm);
+            return 2;
+        }
+    }
+
+    if (load_cclib_modules_from_file(&vm, cclib_path) != 0) {
+        fprintf(stderr, "cvm: failed to read '%s'\n", cclib_path);
+        free_runtime(&vm);
+        return 2;
+    }
+
+    if (load_default_cclib_imports(&vm, options) != 0) {
+        free_runtime(&vm);
+        return 2;
+    }
+
+    for (int i = 0; i < options->cclib_import_count; ++i) {
+        int rc = load_cclib_modules_from_file(&vm, options->cclib_imports[i]);
+        if (rc != 0) {
+            fprintf(stderr, "cvm: failed cclib import '%s' (%d)\n", options->cclib_imports[i], rc);
+            free_runtime(&vm);
+            return 2;
+        }
+    }
+
+    if (vm.mod_count == 0) {
+        fprintf(stderr, "cvm: no embedded ccbin modules found in %s\n", cclib_path);
+        free_runtime(&vm);
+        return 2;
+    }
+
+    const char *entry = options->entry_name ? options->entry_name : "main";
+    RuntimeModule *owner = NULL;
+    const CCFunction *main_fn = find_function(&vm, entry, &owner);
+    if (!main_fn) {
+        for (size_t mi = 0; mi < vm.mod_count && !main_fn; ++mi) {
+            RuntimeModule *m = &vm.mods[mi];
+            for (size_t fi = 0; fi < m->module.function_count; ++fi) {
+                const char *n = m->module.functions[fi].name;
+                size_t nn = n ? strlen(n) : 0;
+                size_t en = strlen(entry);
+                if (n && nn > en + 1 && strcmp(n + nn - en, entry) == 0 && n[nn - en - 1] == '.') {
+                    main_fn = &m->module.functions[fi];
+                    owner = m;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!main_fn) {
+        fprintf(stderr, "cvm: entry '%s' not found in %s\n", entry, cclib_path);
+        free_runtime(&vm);
+        return 2;
+    }
+
+    VMValue retv;
+    int has_ret = 0;
+    if (execute_function(&vm, owner, main_fn, NULL, 0, &retv, &has_ret) != 0) {
+        fprintf(stderr, "cvm: execution failed in %s\n", main_fn->name);
+        free_runtime(&vm);
+        return 1;
+    }
+
+    if (has_ret) {
+        *exit_code = (int)(retv.bits & 0xff);
+    } else {
+        *exit_code = 0;
+    }
+
+    free_runtime(&vm);
+    return 0;
+}
