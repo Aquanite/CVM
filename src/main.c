@@ -51,9 +51,9 @@ int main(int argc, char **argv) {
             }
             cclib_imports[cclib_import_count++] = argv[++i];
         } else if (strcmp(arg, "--jit") == 0) {
-            jit_mode = 2;
-        } else if (strcmp(arg, "--lazy-jit") == 0) {
             jit_mode = 1;
+        } else if (strcmp(arg, "--lazy-jit") == 0) {
+            jit_mode = 2;
         } else if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
             verbose = 1;
         } else if (arg[0] == '-') {

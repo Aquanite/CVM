@@ -111,6 +111,204 @@ static uint64_t as_u64(VMValue v) {
     return v.bits;
 }
 
+static uint64_t value_to_u64_for_type(VMValue v, CCValueType ty) {
+    if (ty == CC_TYPE_F64 || ty == CC_TYPE_F32) {
+        return (uint64_t)bits_to_f64(v.bits);
+    }
+    return as_u64(v);
+}
+
+static size_t vm_type_size(CCValueType ty) {
+    size_t s = cc_value_type_size(ty);
+    return s ? s : 1;
+}
+
+static int vm_type_is_unsigned(CCValueType ty) {
+    switch (ty) {
+    case CC_TYPE_U8:
+    case CC_TYPE_U16:
+    case CC_TYPE_U32:
+    case CC_TYPE_U64:
+    case CC_TYPE_PTR:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static unsigned vm_type_bit_width(CCValueType ty) {
+    switch (ty) {
+    case CC_TYPE_I1:
+        return 1;
+    case CC_TYPE_I8:
+    case CC_TYPE_U8:
+        return 8;
+    case CC_TYPE_I16:
+    case CC_TYPE_U16:
+        return 16;
+    case CC_TYPE_I32:
+    case CC_TYPE_U32:
+    case CC_TYPE_F32:
+        return 32;
+    case CC_TYPE_I64:
+    case CC_TYPE_U64:
+    case CC_TYPE_PTR:
+    case CC_TYPE_F64:
+        return 64;
+    default:
+        return 0;
+    }
+}
+
+static uint64_t vm_mask_for_bits(unsigned bits) {
+    if (bits == 0) {
+        return 0;
+    }
+    if (bits >= 64) {
+        return ~0ULL;
+    }
+    return (1ULL << bits) - 1ULL;
+}
+
+static int64_t vm_sign_extend_bits(uint64_t value, unsigned bits) {
+    if (bits == 0) {
+        return 0;
+    }
+    if (bits >= 64) {
+        return (int64_t)value;
+    }
+    uint64_t mask = vm_mask_for_bits(bits);
+    uint64_t sign_bit = 1ULL << (bits - 1);
+    value &= mask;
+    if (value & sign_bit) {
+        value |= ~mask;
+    }
+    return (int64_t)value;
+}
+
+static double vm_value_as_double(VMValue in, CCValueType from_type) {
+    if (from_type == CC_TYPE_F64) {
+        if (in.type == CC_TYPE_F64) {
+            return bits_to_f64(in.bits);
+        }
+        union {
+            uint64_t u;
+            double d;
+        } cvt;
+        cvt.u = as_u64(in);
+        return cvt.d;
+    }
+    if (from_type == CC_TYPE_F32) {
+        if (in.type == CC_TYPE_F64) {
+            return bits_to_f64(in.bits);
+        }
+        union {
+            uint32_t u;
+            float f;
+        } cvt;
+        cvt.u = (uint32_t)as_u64(in);
+        return (double)cvt.f;
+    }
+    if (in.type == CC_TYPE_F64) {
+        return bits_to_f64(in.bits);
+    }
+    return (double)as_i64(in);
+}
+
+static VMValue load_indirect_value(uintptr_t addr, CCValueType ty, int is_unsigned) {
+    VMValue out;
+    memset(&out, 0, sizeof(out));
+    out.type = ty;
+    out.is_unsigned = is_unsigned;
+
+    switch (ty) {
+    case CC_TYPE_I1:
+    case CC_TYPE_U8:
+        out.bits = (uint64_t)(*(uint8_t *)addr);
+        break;
+    case CC_TYPE_I8:
+        out.bits = (uint64_t)(int64_t)(*(int8_t *)addr);
+        break;
+    case CC_TYPE_I16:
+        out.bits = (uint64_t)(int64_t)(*(int16_t *)addr);
+        break;
+    case CC_TYPE_U16:
+        out.bits = (uint64_t)(*(uint16_t *)addr);
+        break;
+    case CC_TYPE_I32:
+        out.bits = (uint64_t)(int64_t)(*(int32_t *)addr);
+        break;
+    case CC_TYPE_U32:
+        out.bits = (uint64_t)(*(uint32_t *)addr);
+        break;
+    case CC_TYPE_I64:
+    case CC_TYPE_U64:
+    case CC_TYPE_PTR:
+        out.bits = *(uint64_t *)addr;
+        break;
+    case CC_TYPE_F32: {
+        float f = *(float *)addr;
+        out.type = CC_TYPE_F64;
+        out.bits = f64_to_bits((double)f);
+        break;
+    }
+    case CC_TYPE_F64:
+        out.bits = f64_to_bits(*(double *)addr);
+        out.type = CC_TYPE_F64;
+        break;
+    default:
+        out.bits = 0;
+        break;
+    }
+
+    return out;
+}
+
+static void store_indirect_value(uintptr_t addr, CCValueType ty, VMValue in) {
+    switch (ty) {
+    case CC_TYPE_I1:
+    case CC_TYPE_U8:
+        *(uint8_t *)addr = (uint8_t)(value_to_u64_for_type(in, ty) & 0xffu);
+        break;
+    case CC_TYPE_I8:
+        *(int8_t *)addr = (int8_t)value_to_u64_for_type(in, ty);
+        break;
+    case CC_TYPE_I16:
+        *(int16_t *)addr = (int16_t)value_to_u64_for_type(in, ty);
+        break;
+    case CC_TYPE_U16:
+        *(uint16_t *)addr = (uint16_t)value_to_u64_for_type(in, ty);
+        break;
+    case CC_TYPE_I32:
+        *(int32_t *)addr = (int32_t)value_to_u64_for_type(in, ty);
+        break;
+    case CC_TYPE_U32:
+        *(uint32_t *)addr = (uint32_t)value_to_u64_for_type(in, ty);
+        break;
+    case CC_TYPE_I64:
+    case CC_TYPE_U64:
+    case CC_TYPE_PTR:
+        *(uint64_t *)addr = (uint64_t)value_to_u64_for_type(in, ty);
+        break;
+    case CC_TYPE_F32: {
+        float f = (in.type == CC_TYPE_F64)
+                      ? (float)bits_to_f64(in.bits)
+                      : (float)(int64_t)as_i64(in);
+        *(float *)addr = f;
+        break;
+    }
+    case CC_TYPE_F64: {
+        double d = (in.type == CC_TYPE_F64)
+                       ? bits_to_f64(in.bits)
+                       : (double)(int64_t)as_i64(in);
+        *(double *)addr = d;
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 static void free_runtime(CVM *vm) {
     if (!vm) {
         return;
@@ -391,6 +589,7 @@ static int call_builtin_symbol(const char *symbol, VMValue *argv, size_t argc, u
 
     if (symbol_equivalent(symbol, "Std_IO_printnl_ptr_to_char") ||
         symbol_equivalent(symbol, "Std_IO_printnl_ptr_to_char_varargs")) {
+        uint64_t written = 0;
         if (argc >= 1) {
             char *formatted = NULL;
             const char *s = NULL;
@@ -402,19 +601,22 @@ static int call_builtin_symbol(const char *symbol, VMValue *argv, size_t argc, u
             }
             if (s) {
                 fputs(s, stdout);
+                written += (uint64_t)strlen(s);
                 if (strchr(s, '\n') == NULL) {
                     fputc('\n', stdout);
+                    written += 1;
                 }
             }
             free(formatted);
             fflush(stdout);
         }
-        *out_ret = 0;
+        *out_ret = written;
         return 1;
     }
 
     if (symbol_equivalent(symbol, "Std_IO_print_ptr_to_char") ||
         symbol_equivalent(symbol, "Std_IO_print_ptr_to_char_varargs")) {
+        uint64_t written = 0;
         if (argc >= 1) {
             char *formatted = NULL;
             const char *s = NULL;
@@ -426,11 +628,70 @@ static int call_builtin_symbol(const char *symbol, VMValue *argv, size_t argc, u
             }
             if (s) {
                 fputs(s, stdout);
+                written += (uint64_t)strlen(s);
             }
             free(formatted);
             fflush(stdout);
         }
-        *out_ret = 0;
+        *out_ret = written;
+        return 1;
+    }
+
+    if (symbol_equivalent(symbol, "fwrite") && argc >= 4) {
+        const void *buf = (const void *)(uintptr_t)argv[0].bits;
+        size_t size = (size_t)as_u64(argv[1]);
+        size_t count = (size_t)as_u64(argv[2]);
+        uintptr_t handle_bits = (uintptr_t)as_u64(argv[3]);
+
+        if (handle_bits <= 2u) {
+            size_t total = size * count;
+            ssize_t written = write((int)handle_bits, buf, total);
+            if (written <= 0 || size == 0) {
+                *out_ret = 0;
+            } else {
+                *out_ret = (uint64_t)((size_t)written / size);
+            }
+            return 1;
+        }
+
+        size_t written_items = fwrite(buf, size, count, (FILE *)handle_bits);
+        *out_ret = (uint64_t)written_items;
+        return 1;
+    }
+
+    if (symbol_equivalent(symbol, "read") && argc >= 3) {
+        int fd = (int)as_i64(argv[0]);
+        void *buf = (void *)(uintptr_t)argv[1].bits;
+        size_t count = (size_t)as_u64(argv[2]);
+        ssize_t rc = read(fd, buf, count);
+        if (rc < 0) {
+            rc = 0;
+        }
+        *out_ret = (uint64_t)(int64_t)rc;
+        return 1;
+    }
+
+    if (symbol_equivalent(symbol, "write") && argc >= 3) {
+        int fd = (int)as_i64(argv[0]);
+        const void *buf = (const void *)(uintptr_t)argv[1].bits;
+        size_t count = (size_t)as_u64(argv[2]);
+        ssize_t rc = write(fd, buf, count);
+        *out_ret = (uint64_t)(int64_t)rc;
+        return 1;
+    }
+
+    if (symbol_equivalent(symbol, "Std_String_strlen_ptr_to_char") && argc >= 1) {
+        const char *s = (const char *)(uintptr_t)argv[0].bits;
+        *out_ret = (uint64_t)(s ? strlen(s) : 0u);
+        return 1;
+    }
+
+    if (symbol_equivalent(symbol, "Std_String_strcmp_ptr_to_char_ptr_to_char") && argc >= 2) {
+        const char *a = (const char *)(uintptr_t)argv[0].bits;
+        const char *b = (const char *)(uintptr_t)argv[1].bits;
+        if (!a) a = "";
+        if (!b) b = "";
+        *out_ret = (uint64_t)(int64_t)strcmp(a, b);
         return 1;
     }
 
@@ -564,6 +825,70 @@ static const CCFunction *find_function(CVM *vm, const char *name, RuntimeModule 
     return NULL;
 }
 
+static const CCFunction *find_function_exact(CVM *vm, const char *name, RuntimeModule **owner) {
+    RuntimeModule *resolved_owner = NULL;
+    if (!vm || !name) {
+        if (owner) {
+            *owner = NULL;
+        }
+        return NULL;
+    }
+
+    for (size_t mi = 0; mi < vm->mod_count; ++mi) {
+        RuntimeModule *m = &vm->mods[mi];
+        for (size_t fi = 0; fi < m->module.function_count; ++fi) {
+            const CCFunction *fn = &m->module.functions[fi];
+            if (fn->name && strcmp(fn->name, name) == 0) {
+                resolved_owner = m;
+                if (owner) {
+                    *owner = resolved_owner;
+                }
+                return fn;
+            }
+        }
+    }
+
+    if (owner) {
+        *owner = NULL;
+    }
+    return NULL;
+}
+
+static int vm_declares_extern_exact(CVM *vm, const char *name) {
+    if (!vm || !name) {
+        return 0;
+    }
+    for (size_t mi = 0; mi < vm->mod_count; ++mi) {
+        RuntimeModule *m = &vm->mods[mi];
+        for (size_t ei = 0; ei < m->module.extern_count; ++ei) {
+            const CCExtern *ex = &m->module.externs[ei];
+            if (ex->name && strcmp(ex->name, name) == 0) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static const CCFunction *find_function_by_ptr(CVM *vm, uintptr_t fn_ptr, RuntimeModule **owner) {
+    if (!vm || !fn_ptr) {
+        return NULL;
+    }
+    for (size_t mi = 0; mi < vm->mod_count; ++mi) {
+        RuntimeModule *m = &vm->mods[mi];
+        for (size_t fi = 0; fi < m->module.function_count; ++fi) {
+            const CCFunction *fn = &m->module.functions[fi];
+            if ((uintptr_t)fn == fn_ptr) {
+                if (owner) {
+                    *owner = m;
+                }
+                return fn;
+            }
+        }
+    }
+    return NULL;
+}
+
 static GlobalSlot *find_global_slot(CVM *vm, const char *name) {
     for (size_t mi = 0; mi < vm->mod_count; ++mi) {
         RuntimeModule *m = &vm->mods[mi];
@@ -637,33 +962,95 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
         }
     }
 
-    VMValue *locals = NULL;
+    uint8_t *local_mem = NULL;
+    size_t *local_offsets = NULL;
     if (fn->local_count > 0) {
-        locals = (VMValue *)calloc(fn->local_count, sizeof(VMValue));
-        if (!locals) {
+        local_offsets = (size_t *)calloc(fn->local_count, sizeof(size_t));
+        if (!local_offsets) {
             return -1;
         }
+        size_t total = 0;
         for (size_t i = 0; i < fn->local_count; ++i) {
-            locals[i].type = fn->local_types[i];
+            size_t sz = vm_type_size(fn->local_types[i]);
+            total = (total + 7u) & ~7u;
+            local_offsets[i] = total;
+            total += sz;
+        }
+        local_mem = (uint8_t *)calloc(total ? total : 1, 1);
+        if (!local_mem) {
+            free(local_offsets);
+            return -1;
+        }
+    }
+
+    uint8_t *param_mem = NULL;
+    size_t *param_offsets = NULL;
+    size_t param_slot_count = fn->param_count;
+    if (fn->is_varargs && arg_count > param_slot_count) {
+        param_slot_count = arg_count;
+    }
+    if (param_slot_count > 0) {
+        param_offsets = (size_t *)calloc(param_slot_count, sizeof(size_t));
+        if (!param_offsets) {
+            free(local_mem);
+            free(local_offsets);
+            return -1;
+        }
+        size_t total = 0;
+        for (size_t i = 0; i < param_slot_count; ++i) {
+            CCValueType ty = CC_TYPE_U64;
+            if (i < fn->param_count) {
+                ty = fn->param_types[i];
+            } else if (i < arg_count) {
+                ty = args[i].type;
+            }
+            size_t sz = vm_type_size(ty);
+            total = (total + 7u) & ~7u;
+            param_offsets[i] = total;
+            total += sz;
+        }
+        param_mem = (uint8_t *)calloc(total ? total : 1, 1);
+        if (!param_mem) {
+            free(param_offsets);
+            free(local_mem);
+            free(local_offsets);
+            return -1;
+        }
+        size_t copy_count = arg_count < param_slot_count ? arg_count : param_slot_count;
+        for (size_t i = 0; i < copy_count; ++i) {
+            CCValueType ty = (i < fn->param_count) ? fn->param_types[i] : args[i].type;
+            store_indirect_value((uintptr_t)(param_mem + param_offsets[i]),
+                                 ty, args[i]);
         }
     }
 
     VMValue *stack = (VMValue *)calloc(8192, sizeof(VMValue));
     if (!stack) {
-        free(locals);
+        free(param_mem);
+        free(param_offsets);
+        free(local_mem);
+        free(local_offsets);
         return -1;
     }
     size_t sp = 0;
+    void **stack_alloc_ptrs = NULL;
+    size_t stack_alloc_count = 0;
+    size_t stack_alloc_cap = 0;
 
     LabelMap *labels = NULL;
     size_t label_count = 0;
     if (build_labels(fn, &labels, &label_count) != 0) {
         free(stack);
-        free(locals);
+        free(param_mem);
+        free(param_offsets);
+        free(local_mem);
+        free(local_offsets);
         return -1;
     }
 
+    size_t current_ip = 0;
     for (size_t ip = 0; ip < fn->instruction_count; ++ip) {
+        current_ip = ip;
         const CCInstruction *ins = &fn->instructions[ip];
 
         switch (ins->kind) {
@@ -696,7 +1083,10 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
             if (!s) {
                 free(labels);
                 free(stack);
-                free(locals);
+                free(param_mem);
+                free(param_offsets);
+                free(local_mem);
+                free(local_offsets);
                 return -1;
             }
             memcpy(s, ins->data.const_string.bytes, ins->data.const_string.length);
@@ -709,36 +1099,83 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
         }
         case CC_INSTR_LOAD_PARAM: {
             uint32_t idx = ins->data.param.index;
-            if (idx >= arg_count) {
+            if (idx >= param_slot_count || !param_mem) {
                 fprintf(stderr, "cvm: load_param out of range in %s\n", fn->name);
                 goto fail;
             }
-            stack[sp++] = args[idx];
+            VMValue v = load_indirect_value((uintptr_t)(param_mem + param_offsets[idx]),
+                                            ins->data.param.type,
+                                            vm_type_is_unsigned(ins->data.param.type));
+            stack[sp++] = v;
+            break;
+        }
+        case CC_INSTR_ADDR_PARAM: {
+            uint32_t idx = ins->data.param.index;
+            if (idx >= param_slot_count || !param_mem) {
+                fprintf(stderr, "cvm: addr_param out of range in %s\n", fn->name);
+                goto fail;
+            }
+            VMValue ptrv;
+            memset(&ptrv, 0, sizeof(ptrv));
+            ptrv.type = CC_TYPE_PTR;
+            ptrv.is_unsigned = 1;
+            ptrv.bits = (uint64_t)(uintptr_t)(param_mem + param_offsets[idx]);
+            stack[sp++] = ptrv;
             break;
         }
         case CC_INSTR_LOAD_LOCAL: {
             uint32_t idx = ins->data.local.index;
-            if (idx >= fn->local_count) {
+            if (idx >= fn->local_count || !local_mem) {
                 fprintf(stderr, "cvm: load_local out of range in %s\n", fn->name);
                 goto fail;
             }
-            stack[sp++] = locals[idx];
+            VMValue v = load_indirect_value((uintptr_t)(local_mem + local_offsets[idx]),
+                                            fn->local_types[idx],
+                                            vm_type_is_unsigned(fn->local_types[idx]));
+            stack[sp++] = v;
             break;
         }
         case CC_INSTR_STORE_LOCAL: {
             uint32_t idx = ins->data.local.index;
-            if (idx >= fn->local_count || sp == 0) {
+            if (idx >= fn->local_count || sp == 0 || !local_mem) {
                 fprintf(stderr, "cvm: store_local invalid in %s\n", fn->name);
                 goto fail;
             }
-            locals[idx] = stack[--sp];
+            VMValue in = stack[--sp];
+            store_indirect_value((uintptr_t)(local_mem + local_offsets[idx]),
+                                 fn->local_types[idx], in);
+            break;
+        }
+        case CC_INSTR_ADDR_LOCAL: {
+            uint32_t idx = ins->data.local.index;
+            if (idx >= fn->local_count || !local_mem) {
+                fprintf(stderr, "cvm: addr_local out of range in %s\n", fn->name);
+                goto fail;
+            }
+            VMValue ptrv;
+            memset(&ptrv, 0, sizeof(ptrv));
+            ptrv.type = CC_TYPE_PTR;
+            ptrv.is_unsigned = 1;
+            ptrv.bits = (uint64_t)(uintptr_t)(local_mem + local_offsets[idx]);
+            stack[sp++] = ptrv;
             break;
         }
         case CC_INSTR_LOAD_GLOBAL: {
             GlobalSlot *g = find_global_slot(vm, ins->data.global.symbol);
             if (!g) {
-                fprintf(stderr, "cvm: unknown global '%s'\n", ins->data.global.symbol);
-                goto fail;
+                RuntimeModule *fn_owner = NULL;
+                const CCFunction *fn_ptr = find_function(vm, ins->data.global.symbol, &fn_owner);
+                if (!fn_ptr) {
+                    fprintf(stderr, "cvm: unknown global '%s'\n", ins->data.global.symbol);
+                    goto fail;
+                }
+                VMValue fv;
+                memset(&fv, 0, sizeof(fv));
+                fv.type = CC_TYPE_PTR;
+                fv.is_unsigned = 1;
+                fv.bits = (uint64_t)(uintptr_t)fn_ptr;
+                stack[sp++] = fv;
+                break;
             }
             stack[sp++] = g->value;
             break;
@@ -750,6 +1187,60 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
                 goto fail;
             }
             g->value = stack[--sp];
+            break;
+        }
+        case CC_INSTR_ADDR_GLOBAL: {
+            GlobalSlot *g = find_global_slot(vm, ins->data.global.symbol);
+            if (!g) {
+                RuntimeModule *fn_owner = NULL;
+                const CCFunction *fn_ptr = find_function(vm, ins->data.global.symbol, &fn_owner);
+                if (!fn_ptr) {
+                    fprintf(stderr, "cvm: unknown global '%s'\n", ins->data.global.symbol);
+                    goto fail;
+                }
+                VMValue ptrv;
+                memset(&ptrv, 0, sizeof(ptrv));
+                ptrv.type = CC_TYPE_PTR;
+                ptrv.is_unsigned = 1;
+                ptrv.bits = (uint64_t)(uintptr_t)fn_ptr;
+                stack[sp++] = ptrv;
+                break;
+            }
+            VMValue ptrv;
+            memset(&ptrv, 0, sizeof(ptrv));
+            ptrv.type = CC_TYPE_PTR;
+            ptrv.is_unsigned = 1;
+            ptrv.bits = (uint64_t)(uintptr_t)&g->value.bits;
+            stack[sp++] = ptrv;
+            break;
+        }
+        case CC_INSTR_LOAD_INDIRECT: {
+            if (sp < 1) {
+                goto fail;
+            }
+            VMValue addr = stack[--sp];
+            uintptr_t p = (uintptr_t)as_u64(addr);
+            if (!p) {
+                fprintf(stderr, "cvm: null pointer load in %s\n", fn->name);
+                goto fail;
+            }
+            VMValue out = load_indirect_value(p, ins->data.memory.type,
+                                              ins->data.memory.is_unsigned);
+            stack[sp++] = out;
+            break;
+        }
+        case CC_INSTR_STORE_INDIRECT: {
+            if (sp < 2) {
+                goto fail;
+            }
+            VMValue in = stack[--sp];
+            VMValue addr = stack[--sp];
+            uintptr_t p = (uintptr_t)as_u64(addr);
+            if (!p) {
+                fprintf(stderr, "cvm: null pointer store in %s\n", fn->name);
+                goto fail;
+            }
+            store_indirect_value(p, ins->data.memory.type, in);
             break;
         }
         case CC_INSTR_BINOP: {
@@ -767,22 +1258,46 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
                 double a = bits_to_f64(lhs.bits);
                 double b = bits_to_f64(rhs.bits);
                 double r = 0.0;
-                switch (ins->data.binop.op) {
-                case CC_BINOP_ADD:
-                    r = a + b;
-                    break;
-                case CC_BINOP_SUB:
-                    r = a - b;
-                    break;
-                case CC_BINOP_MUL:
-                    r = a * b;
-                    break;
-                case CC_BINOP_DIV:
-                    r = a / b;
-                    break;
-                default:
-                    fprintf(stderr, "cvm: unsupported float binop in %s\n", fn->name);
-                    goto fail;
+                if (ins->data.binop.type == CC_TYPE_F32) {
+                    float af = (float)a;
+                    float bf = (float)b;
+                    float rf = 0.0f;
+                    switch (ins->data.binop.op) {
+                    case CC_BINOP_ADD:
+                        rf = af + bf;
+                        break;
+                    case CC_BINOP_SUB:
+                        rf = af - bf;
+                        break;
+                    case CC_BINOP_MUL:
+                        rf = af * bf;
+                        break;
+                    case CC_BINOP_DIV:
+                        rf = af / bf;
+                        break;
+                    default:
+                        fprintf(stderr, "cvm: unsupported float binop in %s\n", fn->name);
+                        goto fail;
+                    }
+                    r = (double)rf;
+                } else {
+                    switch (ins->data.binop.op) {
+                    case CC_BINOP_ADD:
+                        r = a + b;
+                        break;
+                    case CC_BINOP_SUB:
+                        r = a - b;
+                        break;
+                    case CC_BINOP_MUL:
+                        r = a * b;
+                        break;
+                    case CC_BINOP_DIV:
+                        r = a / b;
+                        break;
+                    default:
+                        fprintf(stderr, "cvm: unsupported float binop in %s\n", fn->name);
+                        goto fail;
+                    }
                 }
                 out.type = CC_TYPE_F64;
                 out.bits = f64_to_bits(r);
@@ -860,6 +1375,12 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
             } else {
                 uint64_t a = as_u64(lhs);
                 uint64_t b = as_u64(rhs);
+                unsigned cmp_bits = vm_type_bit_width(ins->data.compare.type);
+                if (cmp_bits > 0 && cmp_bits < 64) {
+                    uint64_t mask = vm_mask_for_bits(cmp_bits);
+                    a &= mask;
+                    b &= mask;
+                }
                 switch (ins->data.compare.op) {
                 case CC_COMPARE_EQ:
                     result = (a == b);
@@ -868,16 +1389,40 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
                     result = (a != b);
                     break;
                 case CC_COMPARE_LT:
-                    result = ins->data.compare.is_unsigned ? (a < b) : ((int64_t)a < (int64_t)b);
+                    if (ins->data.compare.is_unsigned) {
+                        result = (a < b);
+                    } else {
+                        int64_t as = vm_sign_extend_bits(a, cmp_bits ? cmp_bits : 64);
+                        int64_t bs = vm_sign_extend_bits(b, cmp_bits ? cmp_bits : 64);
+                        result = (as < bs);
+                    }
                     break;
                 case CC_COMPARE_LE:
-                    result = ins->data.compare.is_unsigned ? (a <= b) : ((int64_t)a <= (int64_t)b);
+                    if (ins->data.compare.is_unsigned) {
+                        result = (a <= b);
+                    } else {
+                        int64_t as = vm_sign_extend_bits(a, cmp_bits ? cmp_bits : 64);
+                        int64_t bs = vm_sign_extend_bits(b, cmp_bits ? cmp_bits : 64);
+                        result = (as <= bs);
+                    }
                     break;
                 case CC_COMPARE_GT:
-                    result = ins->data.compare.is_unsigned ? (a > b) : ((int64_t)a > (int64_t)b);
+                    if (ins->data.compare.is_unsigned) {
+                        result = (a > b);
+                    } else {
+                        int64_t as = vm_sign_extend_bits(a, cmp_bits ? cmp_bits : 64);
+                        int64_t bs = vm_sign_extend_bits(b, cmp_bits ? cmp_bits : 64);
+                        result = (as > bs);
+                    }
                     break;
                 case CC_COMPARE_GE:
-                    result = ins->data.compare.is_unsigned ? (a >= b) : ((int64_t)a >= (int64_t)b);
+                    if (ins->data.compare.is_unsigned) {
+                        result = (a >= b);
+                    } else {
+                        int64_t as = vm_sign_extend_bits(a, cmp_bits ? cmp_bits : 64);
+                        int64_t bs = vm_sign_extend_bits(b, cmp_bits ? cmp_bits : 64);
+                        result = (as >= bs);
+                    }
                     break;
                 }
             }
@@ -893,17 +1438,233 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
                 goto fail;
             }
             VMValue in = stack[--sp];
-            VMValue out = in;
-            if (ins->data.convert.to_type == CC_TYPE_F64 || ins->data.convert.to_type == CC_TYPE_F32) {
+            VMValue out;
+            memset(&out, 0, sizeof(out));
+
+            CCValueType from = ins->data.convert.from_type;
+            CCValueType to = ins->data.convert.to_type;
+            unsigned from_bits = vm_type_bit_width(from);
+            unsigned to_bits = vm_type_bit_width(to);
+
+            out.type = to;
+            out.is_unsigned = vm_type_is_unsigned(to);
+
+            switch (ins->data.convert.kind) {
+            case CC_CONVERT_TRUNC: {
+                uint64_t raw = as_u64(in);
+                if (from_bits > 0 && from_bits < 64) {
+                    raw &= vm_mask_for_bits(from_bits);
+                }
+                if (to_bits > 0 && to_bits < 64) {
+                    raw &= vm_mask_for_bits(to_bits);
+                }
+                out.bits = raw;
+                break;
+            }
+            case CC_CONVERT_SEXT: {
+                uint64_t raw = as_u64(in);
+                if (from_bits > 0 && from_bits < 64) {
+                    raw &= vm_mask_for_bits(from_bits);
+                }
+                int64_t ext = vm_sign_extend_bits(raw, from_bits ? from_bits : 64);
+                uint64_t result = (uint64_t)ext;
+                if (to_bits > 0 && to_bits < 64) {
+                    result &= vm_mask_for_bits(to_bits);
+                }
+                out.bits = result;
+                out.is_unsigned = 0;
+                break;
+            }
+            case CC_CONVERT_ZEXT: {
+                uint64_t raw = as_u64(in);
+                if (from_bits > 0 && from_bits < 64) {
+                    raw &= vm_mask_for_bits(from_bits);
+                }
+                if (to_bits > 0 && to_bits < 64) {
+                    raw &= vm_mask_for_bits(to_bits);
+                }
+                out.bits = raw;
+                out.is_unsigned = 1;
+                break;
+            }
+            case CC_CONVERT_F2I: {
+                double d = vm_value_as_double(in, from);
+                uint64_t result;
+                if (vm_type_is_unsigned(to)) {
+                    result = (uint64_t)d;
+                } else {
+                    int64_t s = (int64_t)d;
+                    result = (uint64_t)s;
+                }
+                if (to_bits > 0 && to_bits < 64) {
+                    result &= vm_mask_for_bits(to_bits);
+                }
+                out.bits = result;
+                break;
+            }
+            case CC_CONVERT_I2F: {
+                uint64_t raw = as_u64(in);
+                if (from_bits > 0 && from_bits < 64) {
+                    raw &= vm_mask_for_bits(from_bits);
+                }
+                double d;
+                if (vm_type_is_unsigned(from)) {
+                    d = (double)raw;
+                } else {
+                    d = (double)vm_sign_extend_bits(raw, from_bits ? from_bits : 64);
+                }
+                if (to == CC_TYPE_F32) {
+                    float f = (float)d;
+                    out.bits = f64_to_bits((double)f);
+                } else {
+                    out.bits = f64_to_bits(d);
+                }
                 out.type = CC_TYPE_F64;
-                out.bits = f64_to_bits((double)as_i64(in));
-            } else if (in.type == CC_TYPE_F64) {
-                out.bits = (uint64_t)bits_to_f64(in.bits);
-                out.type = ins->data.convert.to_type;
-            } else {
-                out.type = ins->data.convert.to_type;
+                out.is_unsigned = 0;
+                break;
+            }
+            case CC_CONVERT_BITCAST: {
+                if (from == to) {
+                    out = in;
+                    break;
+                }
+
+                if (cc_value_type_is_float(from) && cc_value_type_is_float(to)) {
+                    if (from == CC_TYPE_F32 && to == CC_TYPE_F64) {
+                        float f = (float)vm_value_as_double(in, CC_TYPE_F32);
+                        out.bits = f64_to_bits((double)f);
+                        out.type = CC_TYPE_F64;
+                    } else if (from == CC_TYPE_F64 && to == CC_TYPE_F32) {
+                        float f = (float)vm_value_as_double(in, CC_TYPE_F64);
+                        out.bits = f64_to_bits((double)f);
+                        out.type = CC_TYPE_F64;
+                    }
+                    break;
+                }
+
+                if (cc_value_type_is_float(from) && !cc_value_type_is_float(to)) {
+                    uint64_t raw = 0;
+                    if (from == CC_TYPE_F32) {
+                        union {
+                            float f;
+                            uint32_t u;
+                        } f32;
+                        f32.f = (float)vm_value_as_double(in, CC_TYPE_F32);
+                        raw = f32.u;
+                    } else {
+                        union {
+                            double d;
+                            uint64_t u;
+                        } f64;
+                        f64.d = vm_value_as_double(in, CC_TYPE_F64);
+                        raw = f64.u;
+                    }
+                    if (to_bits > 0 && to_bits < 64) {
+                        raw &= vm_mask_for_bits(to_bits);
+                    }
+                    out.bits = raw;
+                    break;
+                }
+
+                if (!cc_value_type_is_float(from) && cc_value_type_is_float(to)) {
+                    uint64_t raw = as_u64(in);
+                    if (from_bits > 0 && from_bits < 64) {
+                        raw &= vm_mask_for_bits(from_bits);
+                    }
+                    if (to == CC_TYPE_F32) {
+                        union {
+                            uint32_t u;
+                            float f;
+                        } f32;
+                        f32.u = (uint32_t)(raw & 0xffffffffu);
+                        out.bits = f64_to_bits((double)f32.f);
+                    } else {
+                        union {
+                            uint64_t u;
+                            double d;
+                        } f64;
+                        f64.u = raw;
+                        out.bits = f64_to_bits(f64.d);
+                    }
+                    out.type = CC_TYPE_F64;
+                    out.is_unsigned = 0;
+                    break;
+                }
+
+                {
+                    uint64_t raw = as_u64(in);
+                    if (from_bits > 0 && from_bits < 64) {
+                        raw &= vm_mask_for_bits(from_bits);
+                    }
+                    if (to_bits > 0 && to_bits < 64) {
+                        raw &= vm_mask_for_bits(to_bits);
+                    }
+                    out.bits = raw;
+                }
+                break;
+            }
+            default:
+                out = in;
+                out.type = to;
+                out.is_unsigned = vm_type_is_unsigned(to);
+                break;
             }
             stack[sp++] = out;
+            break;
+        }
+        case CC_INSTR_UNOP: {
+            if (sp < 1) {
+                goto fail;
+            }
+            VMValue in = stack[--sp];
+            VMValue out = in;
+            switch (ins->data.unop.op) {
+            case CC_UNOP_NEG:
+                if (in.type == CC_TYPE_F64) {
+                    out.type = CC_TYPE_F64;
+                    out.bits = f64_to_bits(-bits_to_f64(in.bits));
+                } else {
+                    out.bits = (uint64_t)(-(int64_t)as_i64(in));
+                }
+                break;
+            case CC_UNOP_NOT:
+                out.type = CC_TYPE_I1;
+                out.is_unsigned = 1;
+                out.bits = as_u64(in) ? 0u : 1u;
+                break;
+            case CC_UNOP_BITNOT:
+                out.bits = ~as_u64(in);
+                break;
+            }
+            stack[sp++] = out;
+            break;
+        }
+        case CC_INSTR_STACK_ALLOC: {
+            size_t n = (size_t)ins->data.stack_alloc.size_bytes;
+            if (n == 0)
+                n = 1;
+            void *mem = calloc(1, n);
+            if (!mem) {
+                goto fail;
+            }
+            if (stack_alloc_count == stack_alloc_cap) {
+                size_t next_cap = stack_alloc_cap ? (stack_alloc_cap * 2) : 8;
+                void **grown = (void **)realloc(stack_alloc_ptrs,
+                                                next_cap * sizeof(void *));
+                if (!grown) {
+                    free(mem);
+                    goto fail;
+                }
+                stack_alloc_ptrs = grown;
+                stack_alloc_cap = next_cap;
+            }
+            stack_alloc_ptrs[stack_alloc_count++] = mem;
+            VMValue ptrv;
+            memset(&ptrv, 0, sizeof(ptrv));
+            ptrv.type = CC_TYPE_PTR;
+            ptrv.is_unsigned = 1;
+            ptrv.bits = (uint64_t)(uintptr_t)mem;
+            stack[sp++] = ptrv;
             break;
         }
         case CC_INSTR_DUP: {
@@ -946,6 +1707,19 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
             ip = target;
             break;
         }
+        case CC_INSTR_TEST_NULL: {
+            if (sp < 1) {
+                goto fail;
+            }
+            VMValue in = stack[--sp];
+            VMValue out;
+            memset(&out, 0, sizeof(out));
+            out.type = CC_TYPE_I1;
+            out.is_unsigned = 1;
+            out.bits = (as_u64(in) == 0) ? 1u : 0u;
+            stack[sp++] = out;
+            break;
+        }
         case CC_INSTR_CALL: {
             size_t argc = ins->data.call.arg_count;
             if (sp < argc) {
@@ -974,7 +1748,19 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
             }
 
             RuntimeModule *target_owner = NULL;
-            const CCFunction *callee = find_function(vm, ins->data.call.symbol, &target_owner);
+            const CCFunction *callee = NULL;
+            int prefer_extern = 0;
+            if (ins->data.call.symbol) {
+                callee = find_function_exact(vm, ins->data.call.symbol, &target_owner);
+                if (!callee) {
+                    prefer_extern = vm_declares_extern_exact(vm, ins->data.call.symbol);
+                }
+            }
+            if (!callee) {
+                if (!prefer_extern) {
+                    callee = find_function(vm, ins->data.call.symbol, &target_owner);
+                }
+            }
             if (callee) {
                 VMValue retv;
                 int call_has_ret = 0;
@@ -983,8 +1769,16 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
                 if (rc != 0) {
                     goto fail;
                 }
-                if (call_has_ret && callee->return_type != CC_TYPE_VOID) {
-                    stack[sp++] = retv;
+                if (ins->data.call.return_type != CC_TYPE_VOID) {
+                    if (call_has_ret) {
+                        stack[sp++] = retv;
+                    } else {
+                        VMValue defv;
+                        memset(&defv, 0, sizeof(defv));
+                        defv.type = ins->data.call.return_type;
+                        defv.is_unsigned = vm_type_is_unsigned(ins->data.call.return_type);
+                        stack[sp++] = defv;
+                    }
                 }
             } else {
                 uint64_t call_args[8];
@@ -1016,19 +1810,100 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
             }
             break;
         }
+        case CC_INSTR_CALL_INDIRECT: {
+            size_t argc = ins->data.call.arg_count;
+            if (sp < argc + 1) {
+                goto fail;
+            }
+
+            VMValue callee_ptr = stack[--sp];
+            uintptr_t target_ptr = (uintptr_t)as_u64(callee_ptr);
+
+            VMValue *argv = (VMValue *)calloc(argc ? argc : 1, sizeof(VMValue));
+            if (!argv) {
+                goto fail;
+            }
+            for (size_t i = 0; i < argc; ++i) {
+                argv[argc - 1 - i] = stack[--sp];
+            }
+
+            RuntimeModule *target_owner = NULL;
+            const CCFunction *callee = find_function_by_ptr(vm, target_ptr, &target_owner);
+            if (callee) {
+                VMValue retv;
+                int call_has_ret = 0;
+                int rc = execute_function(vm, target_owner, callee, argv, argc, &retv, &call_has_ret);
+                free(argv);
+                if (rc != 0) {
+                    goto fail;
+                }
+                if (ins->data.call.return_type != CC_TYPE_VOID) {
+                    if (call_has_ret) {
+                        stack[sp++] = retv;
+                    } else {
+                        VMValue defv;
+                        memset(&defv, 0, sizeof(defv));
+                        defv.type = ins->data.call.return_type;
+                        defv.is_unsigned = vm_type_is_unsigned(ins->data.call.return_type);
+                        stack[sp++] = defv;
+                    }
+                }
+            } else {
+                uint64_t call_args[8];
+                if (argc > 8 || target_ptr == 0) {
+                    free(argv);
+                    fprintf(stderr, "cvm: invalid indirect call target in %s\n", fn->name);
+                    goto fail;
+                }
+                for (size_t i = 0; i < argc; ++i) {
+                    call_args[i] = argv[i].bits;
+                }
+                uint64_t raw = call_c_u64((void *)target_ptr, call_args, argc);
+                free(argv);
+                if (ins->data.call.return_type != CC_TYPE_VOID) {
+                    VMValue retv;
+                    retv.bits = raw;
+                    retv.type = ins->data.call.return_type;
+                    retv.is_unsigned = 0;
+                    stack[sp++] = retv;
+                }
+            }
+            break;
+        }
+        case CC_INSTR_JUMP_INDIRECT:
+            fprintf(stderr, "cvm: jump_indirect not yet supported in %s\n", fn->name);
+            goto fail;
         case CC_INSTR_RET: {
+            uintptr_t escaped_stack_alloc = 0;
             if (ins->data.ret.has_value) {
                 if (sp < 1) {
                     goto fail;
                 }
                 *out_ret = stack[--sp];
                 *has_ret = 1;
+                escaped_stack_alloc = (uintptr_t)out_ret->bits;
+                if (escaped_stack_alloc != 0 && stack_alloc_ptrs) {
+                    for (size_t i = 0; i < stack_alloc_count; ++i) {
+                        if ((uintptr_t)stack_alloc_ptrs[i] == escaped_stack_alloc) {
+                            stack_alloc_ptrs[i] = NULL;
+                            break;
+                        }
+                    }
+                }
             } else {
                 *has_ret = 0;
             }
             free(labels);
             free(stack);
-            free(locals);
+            free(param_mem);
+            free(param_offsets);
+            free(local_mem);
+            free(local_offsets);
+            if (stack_alloc_ptrs) {
+                for (size_t i = 0; i < stack_alloc_count; ++i)
+                    free(stack_alloc_ptrs[i]);
+                free(stack_alloc_ptrs);
+            }
             return 0;
         }
         case CC_INSTR_COMMENT:
@@ -1047,13 +1922,39 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
     *has_ret = 0;
     free(labels);
     free(stack);
-    free(locals);
+    free(param_mem);
+    free(param_offsets);
+    free(local_mem);
+    free(local_offsets);
+    if (stack_alloc_ptrs) {
+        for (size_t i = 0; i < stack_alloc_count; ++i)
+            free(stack_alloc_ptrs[i]);
+        free(stack_alloc_ptrs);
+    }
     return 0;
 
 fail:
+    if (fn) {
+        int kind = -1;
+        if (current_ip < fn->instruction_count) {
+            kind = (int)fn->instructions[current_ip].kind;
+        }
+        fprintf(stderr, "cvm: fail in %s at ip=%zu kind=%d\n",
+                fn->name ? fn->name : "<anon>",
+                current_ip,
+                kind);
+    }
     free(labels);
     free(stack);
-    free(locals);
+    free(param_mem);
+    free(param_offsets);
+    free(local_mem);
+    free(local_offsets);
+    if (stack_alloc_ptrs) {
+        for (size_t i = 0; i < stack_alloc_count; ++i)
+            free(stack_alloc_ptrs[i]);
+        free(stack_alloc_ptrs);
+    }
     return -1;
 }
 
