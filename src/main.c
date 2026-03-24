@@ -1,12 +1,28 @@
 #include "cvm.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 static void usage(void) {
     fprintf(stderr,
-            "Usage: cvm <input.cclib> [--entry name] [--import <shared-lib>] [--import-cclib <path>] [--jit|--lazy-jit] [--version] [-v]\n");
+            "Usage: cvm <input.cclib> [--entry name] [--import <shared-lib>] [--import-cclib <path>] [--jit|--lazy-jit] [--jit-profile] [--jit-hot-threshold N] [--jit-loop-threshold N] [--version] [-v]\n");
+}
+
+static int parse_u64(const char *text, unsigned long long *out) {
+    char *end = NULL;
+    unsigned long long v;
+    if (!text || !*text || !out) {
+        return -1;
+    }
+    errno = 0;
+    v = strtoull(text, &end, 10);
+    if (errno != 0 || !end || *end != '\0') {
+        return -1;
+    }
+    *out = v;
+    return 0;
 }
 
 static void print_version(void) {
@@ -24,6 +40,9 @@ int main(int argc, char **argv) {
     int import_count = 0;
     int cclib_import_count = 0;
     int jit_mode = 0;
+    int jit_profile = 0;
+    unsigned long long jit_hot_threshold = 128;
+    unsigned long long jit_loop_hot_threshold = 10000;
     int verbose = 0;
 
     for (int i = 1; i < argc; ++i) {
@@ -54,6 +73,20 @@ int main(int argc, char **argv) {
             jit_mode = 1;
         } else if (strcmp(arg, "--lazy-jit") == 0) {
             jit_mode = 2;
+        } else if (strcmp(arg, "--jit-profile") == 0) {
+            jit_profile = 1;
+        } else if (strcmp(arg, "--jit-hot-threshold") == 0) {
+            if (i + 1 >= argc || parse_u64(argv[i + 1], &jit_hot_threshold) != 0) {
+                usage();
+                return 2;
+            }
+            ++i;
+        } else if (strcmp(arg, "--jit-loop-threshold") == 0) {
+            if (i + 1 >= argc || parse_u64(argv[i + 1], &jit_loop_hot_threshold) != 0) {
+                usage();
+                return 2;
+            }
+            ++i;
         } else if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
             verbose = 1;
         } else if (arg[0] == '-') {
@@ -80,6 +113,9 @@ int main(int argc, char **argv) {
     options.cclib_import_count = cclib_import_count;
     options.program_path = argv[0];
     options.jit_mode = jit_mode;
+    options.jit_profile = jit_profile;
+    options.jit_hot_threshold = jit_hot_threshold;
+    options.jit_loop_hot_threshold = jit_loop_hot_threshold;
     options.verbose = verbose;
 
     int code = 1;

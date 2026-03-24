@@ -58,6 +58,21 @@ typedef struct ImportHandle {
     int owned;
 } ImportHandle;
 
+typedef struct JitProfileEntry {
+    RuntimeModule *owner;
+    const CCFunction *fn;
+    uint64_t calls;
+    uint64_t loop_backedges;
+    int compiled;
+    int native_blocked;
+} JitProfileEntry;
+
+typedef struct JitNativeEntry {
+    RuntimeModule *owner;
+    const CCFunction *fn;
+    void *fn_ptr;
+} JitNativeEntry;
+
 typedef struct CVM {
     RuntimeModule *mods;
     size_t mod_count;
@@ -72,12 +87,32 @@ typedef struct CVM {
     const CVMOptions *jit_options;
     char **jit_compiled_functions;
     size_t jit_compiled_count;
+    JitProfileEntry *jit_profile_entries;
+    size_t jit_profile_count;
+    JitNativeEntry *jit_native_entries;
+    size_t jit_native_count;
+    uint64_t jit_hot_threshold;
+    uint64_t jit_loop_hot_threshold;
+    int jit_profile_report;
+    int uses_runtime_profiling_controls;
 } CVM;
 
 static int symbol_equivalent(const char *a, const char *b);
 static int rewrite_jit_asm_symbols(const char *asm_path);
 static int run_jit_from_cclib(const char *cclib_path, const CVMOptions *options, int *exit_code);
+static int jit_function_seen(CVM *vm, const char *name);
+static int jit_mark_function(CVM *vm, const char *name);
+static void jit_unmark_function(CVM *vm, const char *name);
 static int jit_compile_function_once(CVM *vm, RuntimeModule *owner, const CCFunction *fn);
+static JitProfileEntry *jit_profile_get(CVM *vm, RuntimeModule *owner, const CCFunction *fn, int create);
+static JitNativeEntry *jit_native_get(CVM *vm, RuntimeModule *owner, const CCFunction *fn, int create);
+static int jit_call_native(const CCFunction *fn, void *fn_ptr, VMValue *argv, size_t argc, VMValue *out_ret);
+static int jit_function_can_native_compile(const CCFunction *fn);
+static void jit_maybe_compile_hot(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
+                                  JitProfileEntry *entry, const char *reason);
+static void cvm_print_jit_profile_report(const CVM *vm);
+static const CCFunction *find_function_by_ptr(CVM *vm, uintptr_t fn_ptr, RuntimeModule **owner);
+static int vm_uses_runtime_profiling_controls(CVM *vm);
 
 static uint64_t f64_to_bits(double v) {
     union {
@@ -342,6 +377,8 @@ static void free_runtime(CVM *vm) {
         }
         free(vm->jit_compiled_functions);
     }
+    free(vm->jit_profile_entries);
+    free(vm->jit_native_entries);
     if (vm->imports) {
         for (size_t i = 0; i < vm->import_count; ++i) {
             if (vm->imports[i].owned && vm->imports[i].handle) {
@@ -582,9 +619,119 @@ static char *format_builtin_varargs(VMValue *argv, size_t argc) {
     return out;
 }
 
-static int call_builtin_symbol(const char *symbol, VMValue *argv, size_t argc, uint64_t *out_ret) {
+static int call_builtin_symbol(CVM *vm, const char *symbol, VMValue *argv, size_t argc, uint64_t *out_ret) {
     if (!symbol || !out_ret) {
         return 0;
+    }
+
+    if ((symbol_equivalent(symbol, "Std_Profiling_IsHotPath_ptr_to_void") ||
+         symbol_equivalent(symbol, "Std.Profiling.IsHotPath")) &&
+        argc >= 1 && vm) {
+        if (vm->jit_mode == 0) {
+            *out_ret = 0;
+            return 1;
+        }
+        uintptr_t fn_ptr = (uintptr_t)as_u64(argv[0]);
+        RuntimeModule *owner = NULL;
+        const CCFunction *fn = find_function_by_ptr(vm, fn_ptr, &owner);
+        if (!fn || !owner) {
+            *out_ret = 0;
+            return 1;
+        }
+
+        JitProfileEntry *entry = jit_profile_get(vm, owner, fn, 0);
+        if (entry) {
+            int hot = 0;
+            if (entry->compiled || jit_function_seen(vm, fn->name)) {
+                hot = 1;
+            }
+            if (!hot && vm->jit_hot_threshold > 0 && entry->calls >= vm->jit_hot_threshold) {
+                hot = 1;
+            }
+            if (!hot && vm->jit_loop_hot_threshold > 0 && entry->loop_backedges >= vm->jit_loop_hot_threshold) {
+                hot = 1;
+            }
+            *out_ret = hot ? 1u : 0u;
+        } else {
+            *out_ret = jit_function_seen(vm, fn->name) ? 1u : 0u;
+        }
+        return 1;
+    }
+
+    if ((symbol_equivalent(symbol, "Std_Profiling_ForceHot_ptr_to_void") ||
+         symbol_equivalent(symbol, "Std.Profiling.ForceHot")) &&
+        argc >= 1 && vm) {
+        if (vm->jit_mode == 0) {
+            *out_ret = 1;
+            return 1;
+        }
+        uintptr_t fn_ptr = (uintptr_t)as_u64(argv[0]);
+        RuntimeModule *owner = NULL;
+        const CCFunction *fn = find_function_by_ptr(vm, fn_ptr, &owner);
+        if (!fn || !owner) {
+            *out_ret = 0;
+            return 1;
+        }
+
+        JitProfileEntry *entry = jit_profile_get(vm, owner, fn, 1);
+        if (!entry) {
+            *out_ret = 0;
+            return 1;
+        }
+
+        if (!jit_function_can_native_compile(fn)) {
+            entry->native_blocked = 1;
+            *out_ret = 0;
+            return 1;
+        }
+
+        if (!jit_function_seen(vm, fn->name)) {
+            if (vm->jit_mode == 2 && vm->jit_options) {
+                if (jit_compile_function_once(vm, owner, fn) != 0) {
+                    entry->native_blocked = 1;
+                    *out_ret = 0;
+                    return 1;
+                }
+            } else if (jit_mark_function(vm, fn->name) != 0) {
+                *out_ret = 0;
+                return 1;
+            }
+        }
+
+        entry->compiled = 1;
+        *out_ret = 1;
+        return 1;
+    }
+
+    if ((symbol_equivalent(symbol, "Std_Profiling_ForceCold_ptr_to_void") ||
+         symbol_equivalent(symbol, "Std.Profiling.ForceCold")) &&
+        argc >= 1 && vm) {
+        if (vm->jit_mode == 0) {
+            *out_ret = 1;
+            return 1;
+        }
+        uintptr_t fn_ptr = (uintptr_t)as_u64(argv[0]);
+        RuntimeModule *owner = NULL;
+        const CCFunction *fn = find_function_by_ptr(vm, fn_ptr, &owner);
+        if (!fn || !owner) {
+            *out_ret = 0;
+            return 1;
+        }
+
+        JitProfileEntry *entry = jit_profile_get(vm, owner, fn, 1);
+        if (!entry) {
+            *out_ret = 0;
+            return 1;
+        }
+
+        entry->calls = 0;
+        entry->loop_backedges = 0;
+        entry->compiled = 0;
+        entry->native_blocked = 0;
+        jit_unmark_function(vm, fn->name);
+
+        *out_ret = 1;
+        return 1;
     }
 
     if (symbol_equivalent(symbol, "Std_IO_printnl_ptr_to_char") ||
@@ -722,6 +869,33 @@ static int symbol_equivalent(const char *a, const char *b) {
         ib++;
     }
     return a[ia] == '\0' && b[ib] == '\0';
+}
+
+static int vm_uses_runtime_profiling_controls(CVM *vm) {
+    if (!vm) {
+        return 0;
+    }
+    for (size_t mi = 0; mi < vm->mod_count; ++mi) {
+        RuntimeModule *m = &vm->mods[mi];
+        for (size_t fi = 0; fi < m->module.function_count; ++fi) {
+            const CCFunction *fn = &m->module.functions[fi];
+            for (size_t ii = 0; ii < fn->instruction_count; ++ii) {
+                const CCInstruction *ins = &fn->instructions[ii];
+                if (ins->kind != CC_INSTR_CALL || !ins->data.call.symbol) {
+                    continue;
+                }
+                if (symbol_equivalent(ins->data.call.symbol, "Std_Profiling_IsHotPath_ptr_to_void") ||
+                    symbol_equivalent(ins->data.call.symbol, "Std_Profiling_ForceHot_ptr_to_void") ||
+                    symbol_equivalent(ins->data.call.symbol, "Std_Profiling_ForceCold_ptr_to_void") ||
+                    symbol_equivalent(ins->data.call.symbol, "Std.Profiling.IsHotPath") ||
+                    symbol_equivalent(ins->data.call.symbol, "Std.Profiling.ForceHot") ||
+                    symbol_equivalent(ins->data.call.symbol, "Std.Profiling.ForceCold")) {
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
 }
 
 static int add_func_alias(CVM *vm, const char *alias, RuntimeModule *owner, const CCFunction *target) {
@@ -933,12 +1107,127 @@ static int label_index(LabelMap *labels, size_t count, const char *name, size_t 
     return -1;
 }
 
+static JitProfileEntry *jit_profile_get(CVM *vm, RuntimeModule *owner, const CCFunction *fn, int create) {
+    if (!vm || !owner || !fn) {
+        return NULL;
+    }
+    for (size_t i = 0; i < vm->jit_profile_count; ++i) {
+        JitProfileEntry *entry = &vm->jit_profile_entries[i];
+        if (entry->owner == owner && entry->fn == fn) {
+            return entry;
+        }
+    }
+    if (!create) {
+        return NULL;
+    }
+
+    size_t next = vm->jit_profile_count + 1;
+    JitProfileEntry *grown = (JitProfileEntry *)realloc(vm->jit_profile_entries,
+                                                        next * sizeof(JitProfileEntry));
+    if (!grown) {
+        return NULL;
+    }
+    vm->jit_profile_entries = grown;
+    vm->jit_profile_entries[vm->jit_profile_count].owner = owner;
+    vm->jit_profile_entries[vm->jit_profile_count].fn = fn;
+    vm->jit_profile_entries[vm->jit_profile_count].calls = 0;
+    vm->jit_profile_entries[vm->jit_profile_count].loop_backedges = 0;
+    vm->jit_profile_entries[vm->jit_profile_count].compiled = 0;
+    vm->jit_profile_entries[vm->jit_profile_count].native_blocked = 0;
+    vm->jit_profile_count = next;
+    return &vm->jit_profile_entries[next - 1];
+}
+
+static void jit_maybe_compile_hot(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
+                                  JitProfileEntry *entry, const char *reason) {
+    int should_compile = 0;
+    if (!vm || !owner || !fn || !entry || vm->jit_mode != 2 || !vm->jit_options) {
+        return;
+    }
+    if (entry->native_blocked) {
+        return;
+    }
+    if (entry->compiled || jit_function_seen(vm, fn->name)) {
+        entry->compiled = 1;
+        return;
+    }
+
+    if (vm->jit_hot_threshold > 0 && entry->calls >= vm->jit_hot_threshold) {
+        should_compile = 1;
+    }
+    if (vm->jit_loop_hot_threshold > 0 && entry->loop_backedges >= vm->jit_loop_hot_threshold) {
+        should_compile = 1;
+    }
+    if (!should_compile) {
+        return;
+    }
+
+    if (!jit_function_can_native_compile(fn)) {
+        entry->native_blocked = 1;
+        if (vm->verbose) {
+            fprintf(stderr,
+                    "cvm[jit]: native compile blocked for '%s' (unsupported call/ABI pattern)\n",
+                    fn->name ? fn->name : "<unnamed>");
+        }
+        return;
+    }
+
+    if (jit_compile_function_once(vm, owner, fn) == 0) {
+        entry->compiled = 1;
+        if (vm->verbose) {
+            fprintf(stderr,
+                    "cvm[jit]: hot-compiled '%s' after %" PRIu64 " calls / %" PRIu64 " loop backedges (%s)\n",
+                    fn->name ? fn->name : "<unnamed>",
+                    entry->calls,
+                    entry->loop_backedges,
+                    reason ? reason : "hotness");
+        }
+    } else if (vm->verbose) {
+        entry->native_blocked = 1;
+        fprintf(stderr,
+                "cvm[jit]: failed hot-compile for '%s', continuing in interpreter\n",
+                fn->name ? fn->name : "<unnamed>");
+    } else {
+        entry->native_blocked = 1;
+    }
+}
+
+static int jit_function_can_native_compile(const CCFunction *fn) {
+    if (!fn) {
+        return 0;
+    }
+    if (fn->is_varargs || fn->param_count > 8) {
+        return 0;
+    }
+    if (fn->return_type == CC_TYPE_F32 || fn->return_type == CC_TYPE_F64) {
+        return 0;
+    }
+    for (size_t i = 0; i < fn->param_count; ++i) {
+        if (fn->param_types[i] == CC_TYPE_F32 || fn->param_types[i] == CC_TYPE_F64) {
+            return 0;
+        }
+    }
+    for (size_t i = 0; i < fn->instruction_count; ++i) {
+        switch (fn->instructions[i].kind) {
+        case CC_INSTR_CALL:
+        case CC_INSTR_CALL_INDIRECT:
+        case CC_INSTR_JUMP_INDIRECT:
+            return 0;
+        default:
+            break;
+        }
+    }
+    return 1;
+}
+
 static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
                             VMValue *args, size_t arg_count,
                             VMValue *out_ret, int *has_ret) {
-    if (vm->jit_mode == 2 && vm->jit_options && owner && fn) {
-        if (jit_compile_function_once(vm, owner, fn) != 0 && vm->verbose) {
-            fprintf(stderr, "cvm[jit]: failed to compile '%s', continuing in interpreter\n", fn->name ? fn->name : "<unnamed>");
+    if (owner && fn) {
+        JitProfileEntry *entry = jit_profile_get(vm, owner, fn, 1);
+        if (entry) {
+            entry->calls += 1;
+            jit_maybe_compile_hot(vm, owner, fn, entry, "call threshold");
         }
     }
 
@@ -1690,6 +1979,13 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
                 fprintf(stderr, "cvm: unknown label '%s'\n", ins->data.jump.target);
                 goto fail;
             }
+            if (owner && fn && target <= ip) {
+                JitProfileEntry *entry = jit_profile_get(vm, owner, fn, 0);
+                if (entry) {
+                    entry->loop_backedges += 1;
+                    jit_maybe_compile_hot(vm, owner, fn, entry, "loop backedge threshold");
+                }
+            }
             ip = target;
             break;
         }
@@ -1703,6 +1999,13 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
             if (label_index(labels, label_count, dst, &target) != 0) {
                 fprintf(stderr, "cvm: unknown label '%s'\n", dst);
                 goto fail;
+            }
+            if (owner && fn && target <= ip) {
+                JitProfileEntry *entry = jit_profile_get(vm, owner, fn, 0);
+                if (entry) {
+                    entry->loop_backedges += 1;
+                    jit_maybe_compile_hot(vm, owner, fn, entry, "loop backedge threshold");
+                }
             }
             ip = target;
             break;
@@ -1734,7 +2037,7 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
             }
 
             uint64_t builtin_raw = 0;
-            int handled_builtin = call_builtin_symbol(ins->data.call.symbol, argv, argc, &builtin_raw);
+            int handled_builtin = call_builtin_symbol(vm, ins->data.call.symbol, argv, argc, &builtin_raw);
             if (handled_builtin) {
                 free(argv);
                 if (ins->data.call.return_type != CC_TYPE_VOID) {
@@ -1762,6 +2065,24 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
                 }
             }
             if (callee) {
+                int used_native = 0;
+                if (vm->jit_mode != 0) {
+                    JitNativeEntry *native = jit_native_get(vm, target_owner, callee, 0);
+                    if (native && native->fn_ptr) {
+                        VMValue native_ret;
+                        if (jit_call_native(callee, native->fn_ptr, argv, argc, &native_ret) == 0) {
+                            used_native = 1;
+                            free(argv);
+                            if (ins->data.call.return_type != CC_TYPE_VOID) {
+                                stack[sp++] = native_ret;
+                            }
+                        }
+                    }
+                }
+                if (used_native) {
+                    break;
+                }
+
                 VMValue retv;
                 int call_has_ret = 0;
                 int rc = execute_function(vm, target_owner, callee, argv, argc, &retv, &call_has_ret);
@@ -2957,6 +3278,136 @@ static int jit_mark_function(CVM *vm, const char *name) {
     return 0;
 }
 
+static JitNativeEntry *jit_native_get(CVM *vm, RuntimeModule *owner, const CCFunction *fn, int create) {
+    if (!vm || !owner || !fn) {
+        return NULL;
+    }
+    for (size_t i = 0; i < vm->jit_native_count; ++i) {
+        JitNativeEntry *entry = &vm->jit_native_entries[i];
+        if (entry->owner == owner && entry->fn == fn) {
+            return entry;
+        }
+    }
+    if (!create) {
+        return NULL;
+    }
+
+    size_t next = vm->jit_native_count + 1;
+    JitNativeEntry *grown = (JitNativeEntry *)realloc(vm->jit_native_entries,
+                                                      next * sizeof(JitNativeEntry));
+    if (!grown) {
+        return NULL;
+    }
+    vm->jit_native_entries = grown;
+    vm->jit_native_entries[vm->jit_native_count].owner = owner;
+    vm->jit_native_entries[vm->jit_native_count].fn = fn;
+    vm->jit_native_entries[vm->jit_native_count].fn_ptr = NULL;
+    vm->jit_native_count = next;
+    return &vm->jit_native_entries[next - 1];
+}
+
+static int jit_call_native(const CCFunction *fn, void *fn_ptr, VMValue *argv, size_t argc, VMValue *out_ret) {
+    uint64_t raw = 0;
+    uint64_t call_args[8];
+
+    if (!fn || !fn_ptr || !out_ret) {
+        return -1;
+    }
+    if (argc > 8 || fn->is_varargs) {
+        return -1;
+    }
+    if (fn->return_type == CC_TYPE_F32 || fn->return_type == CC_TYPE_F64) {
+        return -1;
+    }
+    for (size_t i = 0; i < fn->param_count && i < argc; ++i) {
+        if (fn->param_types[i] == CC_TYPE_F32 || fn->param_types[i] == CC_TYPE_F64) {
+            return -1;
+        }
+    }
+
+    for (size_t i = 0; i < argc; ++i) {
+        call_args[i] = argv[i].bits;
+    }
+
+    raw = call_c_u64(fn_ptr, call_args, argc);
+    out_ret->bits = raw;
+    out_ret->type = fn->return_type;
+    out_ret->is_unsigned = vm_type_is_unsigned(fn->return_type);
+    return 0;
+}
+
+static void jit_unmark_function(CVM *vm, const char *name) {
+    if (!vm || !name || !*name || !vm->jit_compiled_functions) {
+        return;
+    }
+    for (size_t i = 0; i < vm->jit_compiled_count; ++i) {
+        if (vm->jit_compiled_functions[i] && strcmp(vm->jit_compiled_functions[i], name) == 0) {
+            free(vm->jit_compiled_functions[i]);
+            for (size_t j = i + 1; j < vm->jit_compiled_count; ++j) {
+                vm->jit_compiled_functions[j - 1] = vm->jit_compiled_functions[j];
+            }
+            vm->jit_compiled_count -= 1;
+            if (vm->jit_compiled_count == 0) {
+                free(vm->jit_compiled_functions);
+                vm->jit_compiled_functions = NULL;
+            } else {
+                char **shrunk = (char **)realloc(vm->jit_compiled_functions,
+                                                 vm->jit_compiled_count * sizeof(char *));
+                if (shrunk) {
+                    vm->jit_compiled_functions = shrunk;
+                }
+            }
+            return;
+        }
+    }
+}
+
+static int jit_profile_cmp_desc(const void *lhs, const void *rhs) {
+    const JitProfileEntry *a = (const JitProfileEntry *)lhs;
+    const JitProfileEntry *b = (const JitProfileEntry *)rhs;
+    uint64_t ha = a->calls + a->loop_backedges;
+    uint64_t hb = b->calls + b->loop_backedges;
+    if (ha < hb) {
+        return 1;
+    }
+    if (ha > hb) {
+        return -1;
+    }
+    return 0;
+}
+
+static void cvm_print_jit_profile_report(const CVM *vm) {
+    if (!vm || vm->jit_profile_count == 0 || !vm->jit_profile_entries) {
+        return;
+    }
+
+    JitProfileEntry *copy = (JitProfileEntry *)malloc(vm->jit_profile_count * sizeof(JitProfileEntry));
+    if (!copy) {
+        return;
+    }
+    memcpy(copy, vm->jit_profile_entries, vm->jit_profile_count * sizeof(JitProfileEntry));
+    qsort(copy, vm->jit_profile_count, sizeof(JitProfileEntry), jit_profile_cmp_desc);
+
+    fprintf(stderr,
+            "cvm[jit-profiler]: %zu functions observed (hot=%" PRIu64 ", loop=%" PRIu64 ")\n",
+            vm->jit_profile_count,
+            vm->jit_hot_threshold,
+            vm->jit_loop_hot_threshold);
+
+    for (size_t i = 0; i < vm->jit_profile_count; ++i) {
+        const JitProfileEntry *e = &copy[i];
+        const char *name = (e->fn && e->fn->name) ? e->fn->name : "<unnamed>";
+        fprintf(stderr,
+                "  %-40s calls=%" PRIu64 " backedges=%" PRIu64 " compiled=%s\n",
+                name,
+                e->calls,
+                e->loop_backedges,
+                e->compiled ? "yes" : "no");
+    }
+
+    free(copy);
+}
+
 static int jit_compile_function_once(CVM *vm, RuntimeModule *owner, const CCFunction *fn) {
     if (!vm || !owner || !fn || !fn->name || !owner->ccbin_data || owner->ccbin_size == 0 || !vm->jit_options) {
         return -1;
@@ -3009,9 +3460,11 @@ static int jit_compile_function_once(CVM *vm, RuntimeModule *owner, const CCFunc
 
     char out_s[1200];
     char out_o[1200];
+    char out_dylib[1200];
     char function_opt[1152];
     snprintf(out_s, sizeof(out_s), "%s/%s.s", temp_dir, fn->name);
     snprintf(out_o, sizeof(out_o), "%s/%s.o", temp_dir, fn->name);
+    snprintf(out_dylib, sizeof(out_dylib), "%s/%s.dylib", temp_dir, fn->name);
     snprintf(function_opt, sizeof(function_opt), "function=%s", fn->name);
 
     const char *cc_argv[] = {
@@ -3046,6 +3499,63 @@ static int jit_compile_function_once(CVM *vm, RuntimeModule *owner, const CCFunc
         unlink(temp_ccbin);
         return -1;
     }
+
+#if defined(__APPLE__)
+    const char *link_argv[] = {
+        "cc",
+        "-dynamiclib",
+        "-Wl,-undefined,dynamic_lookup",
+        "-o",
+        out_dylib,
+        out_o,
+        NULL
+    };
+#else
+    const char *link_argv[] = {
+        "cc",
+        "-shared",
+        "-o",
+        out_dylib,
+        out_o,
+        NULL
+    };
+#endif
+    if (run_cmdv(link_argv, vm->jit_options->verbose) != 0) {
+        unlink(temp_ccbin);
+        return -1;
+    }
+
+    void *lib = dlopen(out_dylib, RTLD_NOW | RTLD_GLOBAL);
+    if (!lib) {
+        unlink(temp_ccbin);
+        return -1;
+    }
+    if (add_import_handle(vm, out_dylib, 1, lib) != 0) {
+        dlclose(lib);
+        unlink(temp_ccbin);
+        return -1;
+    }
+
+    void *fn_ptr = dlsym(lib, fn->name);
+    if (!fn_ptr) {
+#if defined(__APPLE__)
+        char underscored[1400];
+        if (snprintf(underscored, sizeof(underscored), "_%s", fn->name) > 0) {
+            fn_ptr = dlsym(lib, underscored);
+        }
+#endif
+    }
+    if (!fn_ptr) {
+        unlink(temp_ccbin);
+        return -1;
+    }
+
+    JitNativeEntry *native = jit_native_get(vm, owner, fn, 1);
+    if (!native) {
+        unlink(temp_ccbin);
+        return -1;
+    }
+    native->fn_ptr = fn_ptr;
 
     if (jit_mark_function(vm, fn->name) != 0) {
         unlink(temp_ccbin);
@@ -3127,6 +3637,18 @@ int cvm_run_file(const char *cclib_path, const CVMOptions *options, int *exit_co
     vm.jit_attempted = 0;
     vm.jit_cclib_path = cclib_path;
     vm.jit_options = options;
+    vm.jit_hot_threshold = (uint64_t)options->jit_hot_threshold;
+    vm.jit_loop_hot_threshold = (uint64_t)options->jit_loop_hot_threshold;
+    vm.jit_profile_report = options->jit_profile;
+
+    if (vm.jit_mode == 1) {
+        if (vm.jit_hot_threshold == 0 || vm.jit_hot_threshold > 8) {
+            vm.jit_hot_threshold = 8;
+        }
+        if (vm.jit_loop_hot_threshold == 0 || vm.jit_loop_hot_threshold > 256) {
+            vm.jit_loop_hot_threshold = 256;
+        }
+    }
 
     if (add_import_handle(&vm, "self", 0, dlopen(NULL, RTLD_NOW | RTLD_GLOBAL)) != 0) {
         return 2;
@@ -3177,6 +3699,15 @@ int cvm_run_file(const char *cclib_path, const CVMOptions *options, int *exit_co
         return 2;
     }
 
+    vm.uses_runtime_profiling_controls = vm_uses_runtime_profiling_controls(&vm);
+    if (vm.jit_mode == 1 && vm.uses_runtime_profiling_controls) {
+        vm.jit_mode = 2;
+        if (vm.verbose) {
+            fprintf(stderr,
+                    "cvm[jit]: runtime profiling controls detected; using lazy-jit so Std.Profiling can control hotness\n");
+        }
+    }
+
     const char *entry = options->entry_name ? options->entry_name : "main";
     RuntimeModule *owner = NULL;
     const CCFunction *main_fn = find_function(&vm, entry, &owner);
@@ -3214,6 +3745,10 @@ int cvm_run_file(const char *cclib_path, const CVMOptions *options, int *exit_co
         *exit_code = (int)(retv.bits & 0xff);
     } else {
         *exit_code = 0;
+    }
+
+    if (vm.jit_mode == 2 && (vm.jit_profile_report || vm.verbose)) {
+        cvm_print_jit_profile_report(&vm);
     }
 
     free_runtime(&vm);

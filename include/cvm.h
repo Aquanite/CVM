@@ -13,6 +13,9 @@ typedef struct CVMOptions {
     int cclib_import_count;
     const char *program_path;
     int jit_mode;
+    int jit_profile;
+    unsigned long long jit_hot_threshold;
+    unsigned long long jit_loop_hot_threshold;
     int verbose;
 } CVMOptions;
 
