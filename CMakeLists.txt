@@ -7,6 +7,9 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 set(CHANCECODE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../ChanceCode" CACHE PATH "Path to ChanceCode repository")
 
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBFFI REQUIRED IMPORTED_TARGET libffi)
+
 add_library(chancecode_core_local
     ${CHANCECODE_ROOT}/src/backend.c
     ${CHANCECODE_ROOT}/src/bytecode.c
@@ -33,5 +36,6 @@ target_include_directories(cvm
 target_link_libraries(cvm
     PRIVATE
         chancecode_core_local
+    PkgConfig::LIBFFI
         ${CMAKE_DL_LIBS}
 )

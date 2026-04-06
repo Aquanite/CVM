@@ -5,7 +5,38 @@
 #include <cc/diagnostics.h>
 #include <cc/loader.h>
 
+#include <ffi.h>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <io.h>
+#include <process.h>
+#include <BaseTsd.h>
+#ifndef ssize_t
+typedef SSIZE_T ssize_t;
+#endif
+#ifndef strdup
+#define strdup _strdup
+#endif
+#ifndef access
+#define access _access
+#endif
+#ifndef unlink
+#define unlink _unlink
+#endif
+#ifndef R_OK
+#define R_OK 4
+#endif
+#ifndef X_OK
+#define X_OK 0
+#endif
+#else
 #include <dlfcn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -13,11 +44,60 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
+#endif
+
+#if defined(_WIN32)
+#ifndef RTLD_NOW
+#define RTLD_NOW 0
+#endif
+#ifndef RTLD_GLOBAL
+#define RTLD_GLOBAL 0
+#endif
+
+static void *dlopen(const char *path, int mode) {
+    (void)mode;
+    if (!path) {
+        return (void *)GetModuleHandleA(NULL);
+    }
+    return (void *)LoadLibraryA(path);
+}
+
+static void *dlsym(void *handle, const char *name) {
+    if (!handle || !name) {
+        return NULL;
+    }
+    return (void *)GetProcAddress((HMODULE)handle, name);
+}
+
+static int dlclose(void *handle) {
+    HMODULE self = GetModuleHandleA(NULL);
+    if (!handle || (HMODULE)handle == self) {
+        return 0;
+    }
+    return FreeLibrary((HMODULE)handle) ? 0 : -1;
+}
+
+static const char *dlerror(void) {
+    static char msg[256];
+    DWORD err = GetLastError();
+    if (!err) {
+        return "unknown dynamic loader error";
+    }
+    DWORD n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                             NULL,
+                             err,
+                             0,
+                             msg,
+                             (DWORD)sizeof(msg),
+                             NULL);
+    if (n == 0) {
+        snprintf(msg, sizeof(msg), "windows error %lu", (unsigned long)err);
+    }
+    return msg;
+}
 #endif
 
 typedef struct VMValue {
@@ -467,29 +547,86 @@ static void *resolve_extern_symbol(CVM *vm, const char *name) {
     return NULL;
 }
 
-static uint64_t call_c_u64(void *fn, uint64_t *argv, size_t argc) {
-    switch (argc) {
-    case 0:
-        return ((uint64_t(*)(void))fn)();
-    case 1:
-        return ((uint64_t(*)(uint64_t))fn)(argv[0]);
-    case 2:
-        return ((uint64_t(*)(uint64_t, uint64_t))fn)(argv[0], argv[1]);
-    case 3:
-        return ((uint64_t(*)(uint64_t, uint64_t, uint64_t))fn)(argv[0], argv[1], argv[2]);
-    case 4:
-        return ((uint64_t(*)(uint64_t, uint64_t, uint64_t, uint64_t))fn)(argv[0], argv[1], argv[2], argv[3]);
-    case 5:
-        return ((uint64_t(*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t))fn)(argv[0], argv[1], argv[2], argv[3], argv[4]);
-    case 6:
-        return ((uint64_t(*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t))fn)(argv[0], argv[1], argv[2], argv[3], argv[4], argv[5]);
-    case 7:
-        return ((uint64_t(*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t))fn)(argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6]);
-    case 8:
-        return ((uint64_t(*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t))fn)(argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]);
-    default:
+static uint64_t call_c_u64_runtime(void *fn, uint64_t *argv, size_t argc, int is_varargs) {
+    if (!fn) {
         return 0;
     }
+
+    ffi_cif cif;
+    ffi_status st;
+    ffi_type **arg_types = NULL;
+    void **arg_values = NULL;
+    uint64_t *arg_storage = NULL;
+    uint64_t ret = 0;
+
+    if (argc > 0) {
+        arg_types = (ffi_type **)calloc(argc, sizeof(ffi_type *));
+        arg_values = (void **)calloc(argc, sizeof(void *));
+        arg_storage = (uint64_t *)calloc(argc, sizeof(uint64_t));
+        if (!arg_types || !arg_values || !arg_storage) {
+            free(arg_types);
+            free(arg_values);
+            free(arg_storage);
+            return 0;
+        }
+
+        for (size_t i = 0; i < argc; ++i) {
+            arg_types[i] = &ffi_type_uint64;
+            arg_storage[i] = argv ? argv[i] : 0;
+            arg_values[i] = &arg_storage[i];
+        }
+    }
+
+    if (is_varargs && argc > 0) {
+        st = ffi_prep_cif_var(&cif,
+                              FFI_DEFAULT_ABI,
+                              1,
+                              (unsigned int)argc,
+                              &ffi_type_uint64,
+                              arg_types);
+    } else {
+        st = ffi_prep_cif(&cif,
+                          FFI_DEFAULT_ABI,
+                          (unsigned int)argc,
+                          &ffi_type_uint64,
+                          arg_types);
+    }
+    if (st != FFI_OK) {
+        free(arg_types);
+        free(arg_values);
+        free(arg_storage);
+        return 0;
+    }
+
+    ffi_call(&cif, FFI_FN(fn), &ret, arg_values);
+
+    free(arg_types);
+    free(arg_values);
+    free(arg_storage);
+    return ret;
+}
+
+static uint64_t call_c_u64(void *fn, uint64_t *argv, size_t argc) {
+    return call_c_u64_runtime(fn, argv, argc, 0);
+}
+
+static uint64_t call_c_u64_varargs(void *fn, uint64_t *argv, size_t argc) {
+    return call_c_u64_runtime(fn, argv, argc, 1);
+}
+
+static uint64_t *vm_make_call_args(VMValue *argv, size_t argc) {
+    if (argc == 0) {
+        return NULL;
+    }
+
+    uint64_t *call_args = (uint64_t *)calloc(argc, sizeof(uint64_t));
+    if (!call_args) {
+        return NULL;
+    }
+    for (size_t i = 0; i < argc; ++i) {
+        call_args[i] = argv[i].bits;
+    }
+    return call_args;
 }
 
 static int append_text(char **buf, size_t *len, size_t *cap, const char *text) {
@@ -2102,24 +2239,24 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
                     }
                 }
             } else {
-                uint64_t call_args[8];
-                if (argc > 8) {
-                    fprintf(stderr, "cvm: extern call '%s' exceeds 8 args\n", ins->data.call.symbol);
+                uint64_t *call_args = vm_make_call_args(argv, argc);
+                if (argc > 0 && !call_args) {
                     free(argv);
                     goto fail;
-                }
-                for (size_t i = 0; i < argc; ++i) {
-                    call_args[i] = argv[i].bits;
                 }
 
                 uint64_t raw = 0;
                 void *sym = resolve_extern_symbol(vm, ins->data.call.symbol);
                 if (!sym) {
+                    free(call_args);
                     free(argv);
                     fprintf(stderr, "cvm: unresolved extern '%s'\n", ins->data.call.symbol);
                     goto fail;
                 }
-                raw = call_c_u64(sym, call_args, argc);
+                raw = ins->data.call.is_varargs
+                          ? call_c_u64_varargs(sym, call_args, argc)
+                          : call_c_u64(sym, call_args, argc);
+                free(call_args);
                 free(argv);
                 if (ins->data.call.return_type != CC_TYPE_VOID) {
                     VMValue retv;
@@ -2170,16 +2307,17 @@ static int execute_function(CVM *vm, RuntimeModule *owner, const CCFunction *fn,
                     }
                 }
             } else {
-                uint64_t call_args[8];
-                if (argc > 8 || target_ptr == 0) {
+                uint64_t *call_args = vm_make_call_args(argv, argc);
+                if (target_ptr == 0 || (argc > 0 && !call_args)) {
+                    free(call_args);
                     free(argv);
                     fprintf(stderr, "cvm: invalid indirect call target in %s\n", fn->name);
                     goto fail;
                 }
-                for (size_t i = 0; i < argc; ++i) {
-                    call_args[i] = argv[i].bits;
-                }
-                uint64_t raw = call_c_u64((void *)target_ptr, call_args, argc);
+                uint64_t raw = ins->data.call.is_varargs
+                                   ? call_c_u64_varargs((void *)target_ptr, call_args, argc)
+                                   : call_c_u64((void *)target_ptr, call_args, argc);
+                free(call_args);
                 free(argv);
                 if (ins->data.call.return_type != CC_TYPE_VOID) {
                     VMValue retv;
@@ -2280,6 +2418,37 @@ fail:
 }
 
 static int write_temp_file(const uint8_t *data, size_t size, char *out_path, size_t out_path_sz) {
+#if defined(_WIN32)
+    char temp_dir[MAX_PATH];
+    DWORD dir_len = GetTempPathA((DWORD)sizeof(temp_dir), temp_dir);
+    if (dir_len == 0 || dir_len >= sizeof(temp_dir)) {
+        return -1;
+    }
+
+    char temp_file[MAX_PATH];
+    if (!GetTempFileNameA(temp_dir, "cvm", 0, temp_file)) {
+        return -1;
+    }
+
+    FILE *f = fopen(temp_file, "wb");
+    if (!f) {
+        DeleteFileA(temp_file);
+        return -1;
+    }
+    if (size > 0 && fwrite(data, 1, size, f) != size) {
+        fclose(f);
+        DeleteFileA(temp_file);
+        return -1;
+    }
+    fclose(f);
+
+    if (strlen(temp_file) + 1 > out_path_sz) {
+        DeleteFileA(temp_file);
+        return -1;
+    }
+    strcpy(out_path, temp_file);
+    return 0;
+#else
     const char *tmpl = "/tmp/cvm_ccbin_XXXXXX";
     if (strlen(tmpl) + 1 > out_path_sz) {
         return -1;
@@ -2301,6 +2470,7 @@ static int write_temp_file(const uint8_t *data, size_t size, char *out_path, siz
     }
     close(fd);
     return 0;
+#endif
 }
 
 static int load_runtime_modules(CVM *vm, const CclibFile *lib) {
@@ -2333,7 +2503,7 @@ static int load_runtime_modules(CVM *vm, const CclibFile *lib) {
             rm.ccbin_size = cm->ccbin_size;
         }
 
-        char tmp_path[128];
+        char tmp_path[1024];
         if (write_temp_file(cm->ccbin_data, cm->ccbin_size, tmp_path, sizeof(tmp_path)) != 0) {
             fprintf(stderr, "cvm: failed to materialize ccbin for module %s\n", cm->module_name ? cm->module_name : "<unnamed>");
             return -1;
@@ -2485,6 +2655,12 @@ static void path_dirname_from(const char *path, char *out, size_t out_sz) {
     }
 
     const char *slash = strrchr(path, '/');
+#if defined(_WIN32)
+    const char *backslash = strrchr(path, '\\');
+    if (!slash || (backslash && backslash > slash)) {
+        slash = backslash;
+    }
+#endif
     if (!slash) {
         return;
     }
@@ -2525,9 +2701,20 @@ static int get_executable_dir(const char *program_path, char *out, size_t out_sz
             return 0;
         }
     }
+#elif defined(_WIN32)
+    DWORD n = GetModuleFileNameA(NULL, out, (DWORD)out_sz);
+    if (n > 0 && n < out_sz) {
+        char dir[1024];
+        path_dirname_from(out, dir, sizeof(dir));
+        if (dir[0] != '\0') {
+            strncpy(out, dir, out_sz - 1);
+            out[out_sz - 1] = '\0';
+            return 0;
+        }
+    }
 #endif
 
-    if (program_path && strchr(program_path, '/')) {
+    if (program_path && (strchr(program_path, '/') || strchr(program_path, '\\'))) {
         path_dirname_from(program_path, out, out_sz);
         if (out[0] != '\0') {
             return 0;
@@ -2624,6 +2811,13 @@ static int run_cmdv(const char *const *argv, int verbose) {
         fprintf(stderr, "\n");
     }
 
+#if defined(_WIN32)
+    intptr_t rc = _spawnvp(_P_WAIT, argv[0], argv);
+    if (rc == -1) {
+        return -1;
+    }
+    return rc == 0 ? 0 : -1;
+#else
     pid_t pid = fork();
     if (pid < 0) {
         return -1;
@@ -2641,6 +2835,7 @@ static int run_cmdv(const char *const *argv, int verbose) {
         return 0;
     }
     return -1;
+#endif
 }
 
 static int run_cmd_capture_exit(const char *const *argv, int verbose, int *exit_code) {
@@ -2656,6 +2851,14 @@ static int run_cmd_capture_exit(const char *const *argv, int verbose, int *exit_
         fprintf(stderr, "\n");
     }
 
+#if defined(_WIN32)
+    intptr_t rc = _spawnvp(_P_WAIT, argv[0], argv);
+    if (rc == -1) {
+        return -1;
+    }
+    *exit_code = (int)rc;
+    return 0;
+#else
     pid_t pid = fork();
     if (pid < 0) {
         return -1;
@@ -2674,6 +2877,7 @@ static int run_cmd_capture_exit(const char *const *argv, int verbose, int *exit_
         return 0;
     }
     return -1;
+#endif
 }
 
 static int locate_support_ccb(const CVMOptions *options, const char *name, char *out, size_t out_sz) {
@@ -2829,7 +3033,7 @@ static int compile_cclib_modules_to_objects(const char *cclib_path,
             continue;
         }
 
-        char temp_ccbin[128];
+        char temp_ccbin[1024];
         if (write_temp_file(m->ccbin_data, m->ccbin_size, temp_ccbin, sizeof(temp_ccbin)) != 0) {
             cclib_free(&lib);
             return -1;
@@ -3028,11 +3232,20 @@ static int run_jit_from_ccbin_entry(const uint8_t *ccbin_data,
                                     int function_only,
                                     const CVMOptions *options,
                                     int *exit_code) {
+#if defined(_WIN32)
+    (void)ccbin_data;
+    (void)ccbin_size;
+    (void)entry_symbol;
+    (void)function_only;
+    (void)options;
+    (void)exit_code;
+    return -1;
+#else
     if (!ccbin_data || ccbin_size == 0 || !entry_symbol || !*entry_symbol || !options || !exit_code) {
         return -1;
     }
 
-    char temp_ccbin[128];
+    char temp_ccbin[1024];
     if (write_temp_file(ccbin_data, ccbin_size, temp_ccbin, sizeof(temp_ccbin)) != 0) {
         return -1;
     }
@@ -3246,6 +3459,7 @@ static int run_jit_from_ccbin_entry(const uint8_t *ccbin_data,
     free_path_list(extra_obj_paths, extra_obj_count);
     unlink(temp_ccbin);
     return 0;
+#endif
 }
 
 static int jit_function_seen(CVM *vm, const char *name) {
@@ -3409,6 +3623,12 @@ static void cvm_print_jit_profile_report(const CVM *vm) {
 }
 
 static int jit_compile_function_once(CVM *vm, RuntimeModule *owner, const CCFunction *fn) {
+#if defined(_WIN32)
+    (void)vm;
+    (void)owner;
+    (void)fn;
+    return -1;
+#else
     if (!vm || !owner || !fn || !fn->name || !owner->ccbin_data || owner->ccbin_size == 0 || !vm->jit_options) {
         return -1;
     }
@@ -3416,7 +3636,7 @@ static int jit_compile_function_once(CVM *vm, RuntimeModule *owner, const CCFunc
         return 0;
     }
 
-    char temp_ccbin[128];
+    char temp_ccbin[1024];
     if (write_temp_file(owner->ccbin_data, owner->ccbin_size, temp_ccbin, sizeof(temp_ccbin)) != 0) {
         return -1;
     }
@@ -3563,6 +3783,7 @@ static int jit_compile_function_once(CVM *vm, RuntimeModule *owner, const CCFunc
     }
     unlink(temp_ccbin);
     return 0;
+#endif
 }
 
 static int run_jit_from_cclib(const char *cclib_path, const CVMOptions *options, int *exit_code) {
