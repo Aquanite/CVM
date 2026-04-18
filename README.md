@@ -16,6 +16,28 @@ cmake -S . -B build
 cmake --build build
 ```
 
+### Windows notes
+
+By default, the build pulls prebuilt `libffi` binaries from GitHub releases (`CVM_BUNDLED_LIBFFI=ON`) and links against those local files instead of a globally installed `libffi`.
+
+The archive is selected by target architecture:
+
+- x64: `libffi-3.5.2-x86-64bit-msvc-binaries.zip`
+- x86: `libffi-3.5.2-x86-32bit-msvc-binaries.zip`
+
+The matching `libffi-8.dll` is copied next to the built `cvm` executable after build.
+
+```powershell
+cmake -S . -B build
+cmake --build build --config Release
+```
+
+If you want to use a preinstalled libffi instead, disable bundled mode and pass its prefix:
+
+```powershell
+cmake -S . -B build -DCVM_BUNDLED_LIBFFI=OFF -DLIBFFI_ROOT=C:/path/to/libffi
+```
+
 ## Run
 
 ```sh
